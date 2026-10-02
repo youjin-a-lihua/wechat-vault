@@ -1,0 +1,90 @@
+{
+  "generated": "2026-10-01T18:34:36.049633",
+  "A_old": {
+    "root": "D:\\xwechat_files",
+    "exists": true,
+    "dat": {
+      "sampled": 400,
+      "ok": 391,
+      "total": 400,
+      "ok_rate": 0.9775,
+      "formats": {
+        "xor": 391
+      },
+      "exts": {
+        ".bmp": 200,
+        ".jpg": 185,
+        ".png": 6
+      },
+      "xor_keys": {
+        "45": 200,
+        "42": 191
+      },
+      "errors": {
+        "无法识别：非已知的 .dat 格式，也不是明文媒体": 9
+      }
+    },
+    "backup": {
+      "new_style_dirs": 2,
+      "old_style_files": 2,
+      "magic": {
+        "RMFH": 1,
+        "\n_wx": 1
+      }
+    },
+    "messages": {
+      "db_files": 107,
+      "db_sqlite": 2,
+      "chatpackage": 5
+    },
+    "disk": {
+      "bytes": 50407539807,
+      "files": 52775,
+      "dat_bytes": 2171200455
+    }
+  },
+  "B_new": {
+    "root": "G:\\We chat and QQ\\Wechat\\xwechat_files",
+    "exists": true,
+    "dat": {
+      "sampled": 400,
+      "ok": 398,
+      "total": 400,
+      "ok_rate": 0.995,
+      "formats": {
+        "xor": 398
+      },
+      "exts": {
+        ".bmp": 362,
+        ".jpg": 34,
+        ".png": 1,
+        ".gif": 1
+      },
+      "xor_keys": {
+        "45": 362,
+        "42": 36
+      },
+      "errors": {
+        "无法识别：非已知的 .dat 格式，也不是明文媒体": 2
+      }
+    },
+    "backup": {
+      "new_style_dirs": 2,
+      "old_style_files": 0,
+      "magic": {
+        "RMFH": 1,
+        "\n_wx": 1
+      }
+    },
+    "messages": {
+      "db_files": 97,
+      "db_sqlite": 1,
+      "chatpackage": 5
+    },
+    "disk": {
+      "bytes": 36152172492,
+      "files": 156850,
+      "dat_bytes": 4129508254
+    }
+  }
+}

@@ -1,0 +1,20 @@
+#!/bin/bash
+# ============================================================================
+#  启动钩子（01）：用镜像内最新 autostart 覆盖数据卷旧副本
+# ============================================================================
+#  linuxserver base 的 openbox 会话实际执行的是：
+#      /config/.config/openbox/autostart
+#  且只在它【不存在】时才从 /defaults/autostart 复制（XDG autostart 机制）。
+#  ⚠️ 历史教训：本钩子曾把目标写成 /config/autostart（死路径）——openbox
+#  永远跑旧脚本，导致 PYTHONPATH / WV_BIND_IP 等新逻辑静默失效。
+#  故每次启动强制覆盖到【正确路径】（与 WOC 的 01 钩子同思路）。
+# ============================================================================
+set -eu
+
+if [ -f /defaults/autostart ]; then
+    mkdir -p /config/.config/openbox 2>/dev/null || true
+    cp -f /defaults/autostart /config/.config/openbox/autostart
+    chmod 755 /config/.config/openbox/autostart
+    chown abc:abc /config/.config/openbox/autostart 2>/dev/null || true
+    echo "[方舟] autostart 已同步为镜像内最新版本 → /config/.config/openbox/autostart"
+fi

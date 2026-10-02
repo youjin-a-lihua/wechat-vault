@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────
+# 微信数据方舟 · 忽略规则
+# 建立于 2026-10-02（代码审查机制配套）
+#
+# ⚠️ 本项目的仓库会包含「离线解密」代码，一旦把下面的东西提交上去，
+#    等于把凭据和用户数据一起公开。这份文件是**红线的一部分**，不是可选项。
+# ─────────────────────────────────────────────────────────────
+
+# ── ① 凭据 / 密钥（最高优先级：泄漏即不可逆）──────────────────
+local_keys/
+*_pwhash.txt
+.preflight-denylist
+*.pem
+*.key
+.env
+.env.*
+!env.example
+secrets/
+config.local.*
+*_credentials.json
+*token*.json
+
+# ── ② 用户数据 / 归档产物（体积大且含隐私）────────────────────
+store/
+samples/
+data/
+inbox/
+inbox_v4/
+vault.db
+vault.db-*
+*.db
+*.db-shm
+*.db-wal
+!deploy/vendor/**/*.db
+
+# ── ③ 媒体产物 ───────────────────────────────────────────────
+media/
+orig/
+emoji/
+voice/
+avatars/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.mp4
+*.wav
+*.silk
+*.dat
+# 但文档与界面图标要保留
+!docs/**/*.png
+!viewer/static/icon.svg
+!viewer/static/*.png
+
+# ── ④ 截图 / 调试产物 ────────────────────────────────────────
+_shots*/
+_wxam_out_*
+_wxam_probe/
+_ffmpeg_probe/
+_reader_theme.css
+_chr_profile/
+_probe_*.py
+_probe_*.json
+*.log
+logs/
+
+# ── ⑤ 临时/中间文件 ─────────────────────────────────────────
+*.tmp
+*.upload
+*.b64
+*.bak
+*.orig
+*.rej
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ── ⑥ 编辑器 / 系统 ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── ⑦ 例外：确实需要入库的 ───────────────────────────────────
+!deploy/vendor/**
+!*.md
+!requirements.txt
+!pyproject.toml
+!.gitignore
+
+# 二进制打包产物（vendor 已有源码，勿重复提交）
+deploy/vendor/wxextract.tar.gz

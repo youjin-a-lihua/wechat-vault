@@ -1,0 +1,24 @@
+# 微信数据方舟 · 归档/解密依赖（/opt/wx-venv · Python 3.12 · 数据卷冻结）
+#
+# ⚠️ 说明：这个 venv **不是每次构建时从本文件安装**的 —— 它是「一次性装好、
+# 冻进数据卷 /data/wx_backup/frozen 再挂回 /opt」的（见 deploy/wv-freeze-runtime）。
+# 本文件是**文档性的清单**，记录该 venv 里到底装了什么、版本为何，供：
+#   1. 重建冻结环境时照着装
+#   2. 排查「recreate 后解密链路静默失效」这类问题时核对
+# 版本在容器内实测锁定（2026-10-02）。
+
+# ── 必装（解密/解压核心）────────────────────────────
+pycryptodome==3.23.0      # from Crypto.Cipher import AES —— .dat V2 解密
+zstandard==0.25.0         # 消息 XML 的 zstd 解压
+
+# ── WxAM 语音解码（SILK_V3）─────────────────────────
+# pilk==0.2.4 含 C 扩展 _pilk，官方 wheel 构建失败；需：
+#   apt-get install gcc
+#   取 sdist 源码（pip download --no-binary :all: pilk）
+#   编译：gcc -shared -fPIC -I<pyinclude> $(find src -type d | sed 's/^/-I/') \
+#         $(find src -name '*.c') -o site-packages/pilk/_pilk.so
+pilk==0.2.4
+typing_extensions            # pilk 的运行时依赖
+
+# ── 抓 key 相关（Windows 侧工具 wv_winkey.py 用，容器内无需）──
+# paramiko：NAS 运维脚本用（见各 _nas_*.py），非本项目核心依赖

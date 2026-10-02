@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#ededed">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="数据方舟">
+<title>WeChat Vault · 微信数据方舟</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ 左侧：会话列表 ============ -->
+  <aside id="sidebar">
+    <div class="sb-head">
+      <!-- 账号切换器：一个微信号 = 一个账号（对应 inbox/<微信号>/） -->
+      <div class="sb-account" id="acctSwitcher" title="切换微信账号">
+        <div class="avatar me-avatar" id="acctAvatar">我</div>
+        <div class="acct-meta">
+          <div class="acct-name" id="acctName">全部账号</div>
+          <div class="acct-sub" id="acctSub">载入中…</div>
+        </div>
+        <svg class="acct-caret" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>
+      </div>
+      <div class="acct-menu" id="acctMenu" style="display:none"></div>
+
+      <div class="sb-search">
+        <svg viewBox="0 0 24 24" class="ic-search"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14"/></svg>
+        <input id="convSearch" type="text" placeholder="搜索会话" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="sb-tabs">
+      <button class="tab active" data-sort="recent">最近</button>
+      <button class="tab" data-sort="name">名称</button>
+      <button class="tab-icon" id="btnGlobalSearch" title="查找聊天记录">
+        <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14"/></svg>
+      </button>
+      <button class="tab-icon" id="btnStats" title="统计报告">
+        <svg viewBox="0 0 24 24"><path d="M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z"/></svg>
+      </button>
+      <button class="tab-icon" id="btnArchive" title="归档与存档轨">
+        <svg viewBox="0 0 24 24"><path d="M20.54 5.23l-1.39-1.68A1.45 1.45 0 0 0 18 3H6c-.47 0-.88.21-1.16.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5L6.5 12H10v-2h4v2h3.5L12 17.5zM5.12 5l.81-1h12l.94 1H5.12z"/></svg>
+      </button>
+      <button class="tab-icon" id="btnExportAll" title="导出数据">
+        <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+      </button>
+      <button class="tab-icon" id="btnLogout" title="退出登录" style="display:none">
+        <svg viewBox="0 0 24 24"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
+      </button>
+      <button class="tab-icon" id="btnTheme" title="切换主题">
+        <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+      </button>
+    </div>
+
+    <div id="convList" class="conv-list"></div>
+
+    <div class="sb-foot">
+      <span id="sbStatus">加载中…</span>
+    </div>
+  </aside>
+
+  <!-- ============ 右侧：聊天区 ============ -->
+  <main id="chat">
+    <div id="emptyState" class="empty-state">
+      <div class="es-logo">微</div>
+      <h2>微信数据方舟</h2>
+      <p>从左侧选择一个会话，像用微信一样翻看你的聊天记录</p>
+      <div class="es-tips">
+        <span>🔍 支持全文搜索</span>
+        <span>📊 支持统计报告</span>
+        <span>🌙 支持暗色模式</span>
+      </div>
+      <div id="wechatCard" class="wechat-card" style="display:none">
+        <div class="wc-row">
+          <span id="wechatStatusText">微信运行时：检测中…</span>
+        </div>
+        <div class="wc-progress" id="wechatProgress" style="display:none">
+          <div class="wc-bar" id="wechatBar"></div>
+        </div>
+        <div class="wc-actions">
+          <button id="btnWechatInstall" class="wc-btn" style="display:none">安装微信</button>
+          <a id="btnWechatDesktop" class="wc-btn wc-btn-primary" href="/wechat-desktop" target="_blank" style="display:none">打开微信桌面</a>
+        </div>
+      </div>
+    </div>
+
+    <header id="chatHeader" class="chat-header" style="display:none">
+      <button class="ic-btn" id="btnBack" title="返回">
+        <svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20z"/></svg>
+      </button>
+      <div class="ch-title">
+        <h3 id="chatTitle">—</h3>
+        <span id="chatSub"></span>
+      </div>
+      <div class="ch-actions">
+        <button class="ic-btn" id="btnJumpTop" title="回到最早"><svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8z"/></svg></button>
+        <button class="ic-btn" id="btnJumpBottom" title="跳到最新"><svg viewBox="0 0 24 24"><path d="M20 12l-1.41-1.41L13 16.17V4h-2v12.17l-5.58-5.59L4 12l8 8z"/></svg></button>
+        <button class="ic-btn" id="btnFindDate" title="按日期查找聊天记录"><svg viewBox="0 0 24 24"><path d="M19 4h-1V2h-2v2H8V2H6v2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 16H5V10h14zM5 8V6h14v2z"/></svg></button>
+        <button class="ic-btn" id="btnFind" title="会话内搜索"><svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14"/></svg></button>
+        <button class="ic-btn" id="btnExport" title="导出此会话"><svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg></button>
+      </div>
+      <div class="ch-find" id="findBar" style="display:none">
+        <input id="findInput" type="text" placeholder="在此会话中搜索…">
+        <span id="findCount"></span>
+        <button class="ic-btn sm" id="findPrev">↑</button>
+        <button class="ic-btn sm" id="findNext">↓</button>
+        <button class="ic-btn sm" id="findClose">✕</button>
+      </div>
+    </header>
+
+    <div id="msgScroller" class="msg-scroller">
+      <div id="msgList" class="msg-list"></div>
+      <div id="loadMore" class="load-more" style="display:none">
+        <span class="lm-spin"></span>
+        <span id="loadMoreText">正在加载更早的消息…</span>
+        <button id="btnLoadMore" class="lm-btn" style="display:none">加载更早的消息</button>
+      </div>
+    </div>
+
+    <div id="dayDivider" class="day-divider"></div>
+    <button id="jumpToday" class="jump-today" style="display:none">最新消息</button>
+  </main>
+
+  <!-- ============ 查找聊天记录（关键词 + 类型 + 日期） ============ -->
+  <div id="searchPanel" class="overlay" style="display:none">
+    <div class="ov-card ov-card-wide">
+      <div class="ov-head">
+        <h3 class="ov-title">查找聊天记录</h3>
+        <div class="scope-switch" id="findScope">
+          <button class="scope-btn active" data-scope="all">全部会话</button>
+          <button class="scope-btn" data-scope="conv">当前会话</button>
+        </div>
+        <button class="ic-btn" id="gSearchClose">✕</button>
+      </div>
+
+      <div class="finder-bar">
+        <div class="fb-row">
+          <input id="globalSearchInput" type="text" placeholder="搜索关键词…" autocomplete="off">
+        </div>
+        <div class="fb-row fb-types" id="findTypes">
+          <button class="chip active" data-type="">全部</button>
+          <button class="chip" data-type="text">文本</button>
+          <button class="chip" data-type="image">图片</button>
+          <button class="chip" data-type="video">视频</button>
+          <button class="chip" data-type="file">文件</button>
+          <button class="chip" data-type="link">链接</button>
+          <button class="chip" data-type="voice">语音</button>
+          <button class="chip" data-type="emoji">表情</button>
+        </div>
+        <div class="fb-row fb-dates">
+          <span class="fb-label">日期</span>
+          <input type="date" id="findFrom">
+          <span class="dash">—</span>
+          <input type="date" id="findTo">
+          <div class="quick" id="findQuick">
+            <button class="quick-btn" data-quick="today">今天</button>
+            <button class="quick-btn" data-quick="7">近7天</button>
+            <button class="quick-btn" data-quick="30">近30天</button>
+            <button class="quick-btn" data-quick="year">今年</button>
+            <button class="quick-btn active" data-quick="">全部</button>
+            <button class="quick-btn q-cal" id="findOpenCal" title="按日历定位到某一天">📅 日历</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="gSearchBody" class="ov-body">
+        <div class="hint">输入关键词，或直接选「类型 / 日期」开始查找</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 按日期查找（会话内跳转，含月历） ============ -->
+  <div id="datePanel" class="overlay" style="display:none">
+    <div class="ov-card ov-card-narrow">
+      <div class="ov-head">
+        <h3 class="ov-title">按日期查找</h3>
+        <div class="scope-switch" id="calView">
+          <button class="scope-btn active" data-view="cal">日历</button>
+          <button class="scope-btn" data-view="list">列表</button>
+        </div>
+        <button class="ic-btn" id="dateClose">✕</button>
+      </div>
+      <div id="dateBody" class="ov-body">
+        <div class="hint">读取中…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 统计面板 ============ -->
+  <div id="statsPanel" class="overlay" style="display:none">
+    <div class="ov-card">
+      <div class="ov-head">
+        <h3>统计报告</h3>
+        <button class="ic-btn" id="statsClose">✕</button>
+      </div>
+      <div id="statsBody" class="ov-body"></div>
+    </div>
+  </div>
+
+  <!-- ============ 归档 / 双轨面板 ============ -->
+  <div id="archivePanel" class="overlay" style="display:none">
+    <div class="ov-card">
+      <div class="ov-head">
+        <h3>归档与双轨</h3>
+        <button class="ic-btn" id="archiveClose">✕</button>
+      </div>
+      <div id="archiveBody" class="ov-body">
+        <div class="hint">读取中…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 导出面板 ============ -->
+  <div id="exportPanel" class="overlay" style="display:none">
+    <div class="ov-card">
+      <div class="ov-head">
+        <h3>导出数据</h3>
+        <button class="ic-btn" id="exportClose">✕</button>
+      </div>
+      <div id="exportBody" class="ov-body"></div>
+    </div>
+  </div>
+
+</div>
+<script src="/app.js"></script>
+<script>
+// 注册 Service Worker（PWA：可安装 + 离线外壳）
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}
+</script>
+</body>
+</html>

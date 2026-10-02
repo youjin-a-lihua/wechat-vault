@@ -1,0 +1,32 @@
+{
+  "name": "微信数据方舟 · WeChat Vault",
+  "short_name": "数据方舟",
+  "description": "微信聊天记录长期归档与随时查看（本地 / 局域网）",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#ededed",
+  "theme_color": "#ededed",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "归档与双轨",
+      "short_name": "归档",
+      "url": "/?panel=archive"
+    },
+    {
+      "name": "全部账号",
+      "short_name": "账号",
+      "url": "/?panel=accounts"
+    }
+  ]
+}
