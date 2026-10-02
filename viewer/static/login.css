@@ -56,6 +56,13 @@ button{
 button:hover{filter:brightness(1.06)}
 button:disabled{opacity:.6;cursor:default;filter:none}
 
+/* 次级按钮（跳过设置） */
+button.ghost{
+  margin-top:8px;background:transparent;color:var(--text2);
+  border:1px solid var(--line);font-weight:500;
+}
+button.ghost:hover{color:var(--text);filter:none;background:var(--input)}
+
 .msg{
   min-height:20px;margin-top:11px;font-size:12.5px;color:#e64340;
 }
