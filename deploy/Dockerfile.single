@@ -1,0 +1,149 @@
+# ============================================================================
+#  微信数据方舟 · 单容器一体化镜像
+# ============================================================================
+#  一个容器同时承载：
+#    ① 微信运行时（Xvfb + 官方微信 Linux 版 + KasmVNC）→ 扫码登录、接手机迁移
+#    ② 方舟本体（归档器 / 解析器 / FTS5 检索 / Web 界面 / 导出）
+#
+#  技术基础复用自 WechatOnCloud（Gloridust/WechatOnCloud，开源）：
+#    - linuxserver KasmVNC 基础镜像（自带 Xvfb + openbox + KasmVNC）
+#    - 中文字体与 Qt/GTK 依赖清单（微信原生版 + WeChatAppEx 运行所需）
+#    - 微信运行时下载机制（腾讯官方 CDN，按架构取包）
+#
+#  与 WOC 的区别：不引入面板、不挂 docker.sock、不做多实例。
+#  一个容器、一个端口（8790）、一个数据卷（/data）。
+# ============================================================================
+FROM lscr.io/linuxserver/baseimage-kasmvnc:debianbookworm
+
+LABEL org.opencontainers.image.title="WeChat Vault" \
+      org.opencontainers.image.description="微信聊天记录归档与随时查看（微备份开源对标，单容器一体化）" \
+      org.opencontainers.image.version="2.0-single"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---------------------------------------------------------------------------
+# 0) apt 换清华源（deb.debian.org 国内直连仅几十 KB/s，字体+Qt/GTK 数百 MB 会拖死构建）
+#    bookworm 用 deb822 格式的 /etc/apt/sources.list.d/debian.sources，老格式一并兼容
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+    sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list 2>/dev/null || true; \
+    sed -i 's|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 1) 系统依赖：中文字体 + 微信原生版 Qt 依赖 + WeChatAppEx(CEF) 的 GTK3 依赖
+#    这一组是硬骨头，直接沿用 WOC 已验证的清单，避免重复踩坑。
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get -o Acquire::Languages=none -o Acquire::Retries=3 update; \
+    apt-get install -y --no-install-recommends \
+        curl ca-certificates locales dpkg xz-utils \
+        fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
+        xdotool xclip xsettingsd \
+        libnss3 libgbm1 libasound2 libxss1 \
+        libatomic1 libxdamage1 libxkbcommon-x11-0 \
+        libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1 libxcb-cursor0 \
+        libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 \
+        libxcomposite1 libxrandr2 libxfixes3 libxtst6 libxshmfence1 libdrm2; \
+    sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
+    locale-gen; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV LANG=zh_CN.UTF-8 \
+    LC_ALL=zh_CN.UTF-8 \
+    LIBGL_ALWAYS_SOFTWARE=1
+
+# ---------------------------------------------------------------------------
+# 2) 方舟本体依赖（Python + FastAPI）
+# 依赖清单需先 COPY 进构建上下文，供下方 RUN 里的 pip -r 使用
+COPY requirements.txt /tmp/requirements.txt
+
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+ && python3 -m venv /opt/wv-venv \
+ && /opt/wv-venv/bin/pip install --no-cache-dir \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 3) 方舟源码
+# ---------------------------------------------------------------------------
+WORKDIR /app
+COPY parser/    /app/parser/
+COPY archiver/  /app/archiver/
+COPY viewer/    /app/viewer/
+
+# 方舟数据目录（部分在数据卷下，运行时可见）
+ENV PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai \
+    WV_STORE=/data/vault-store \
+    WV_INBOX=/data/inbox \
+    WV_LOGS=/data/logs \
+    WV_COLD=/data/cold \
+    WV_WECHAT_HOME=/data/wechat
+
+# ---------------------------------------------------------------------------
+# 4) 微信运行时控制脚本（下载/安装到数据卷，不在镜像里打包微信本体）
+# ---------------------------------------------------------------------------
+COPY deploy/wechat-runtime.sh /woc/wechat-runtime.sh
+RUN chmod 755 /woc/wechat-runtime.sh
+
+# ---------------------------------------------------------------------------
+# 5) 桌面会话启动脚本：由 KasmVNC base 的 openbox 会话调用
+#    职责：等微信就绪 → 常驻拉起微信（崩溃自重启）+ 同时拉起方舟服务
+# ---------------------------------------------------------------------------
+COPY deploy/autostart /defaults/autostart
+RUN chmod 755 /defaults/autostart
+
+# ---------------------------------------------------------------------------
+# 6) 启动钩子：给实例唯一 machine-id（避免腾讯设备农场风控）
+# ---------------------------------------------------------------------------
+COPY deploy/wv-identity.sh /custom-cont-init.d/00-wv-identity
+RUN chmod 755 /custom-cont-init.d/00-wv-identity
+
+# 启动钩子（01）：每次启动用镜像内最新 autostart 覆盖数据卷旧副本
+# （linuxserver base 只在文件不存在时才从 /defaults 复制，不加此钩子升级永不生效）
+COPY deploy/wv-update-autostart /custom-cont-init.d/01-wv-autostart
+RUN chmod 755 /custom-cont-init.d/01-wv-autostart
+
+# 启动钩子（02）：把运行时资产（uv Python 3.12 + wx-venv + 解密明文库）
+# 从数据卷 /data/wx_backup/frozen 挂回 /opt —— 见该脚本头部说明。
+# 没有它，容器 recreate 后抓 key / 导出链路会静默失效。
+COPY deploy/wv-freeze-runtime /custom-cont-init.d/02-wv-freeze
+RUN chmod 755 /custom-cont-init.d/02-wv-freeze
+
+# ---------------------------------------------------------------------------
+# 7) 权限与用户
+#    容器内桌面进程以 abc（linuxserver base 默认用户，uid 911）运行；
+#    数据卷 /data 需可写。方舟服务也以该用户运行。
+# ---------------------------------------------------------------------------
+RUN mkdir -p /data/vault-store /data/inbox /data/logs /data/cold /data/wechat \
+ && chown -R abc:abc /data /app 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 8) 微信数据导出依赖（阶段二 C：抓 key + 解密导出，必须固化进镜像——
+#    否则每次 recreate 容器可写层丢弃，docker exec 临时装的包全消失）
+#    · sqlcipher CLI：读微信加密库（message_*.db）
+#    · gdb：attach 运行中微信进程抓 64 位 hex key（需 cap SYS_PTRACE）
+#    · wxchat-export：开源 clean-room 工具「账号发现→抓key→解密→导出 JSONL」
+#      未发布 PyPI；buildkit 构建网络直连 GitHub 反复 TLS 断流（curl16/GnuTLS-110），
+#      故改为本地 vendor（deploy/vendor/wxchat-export）COPY 进镜像，构建不依赖网络。
+#      要求 python>=3.13 但零依赖、无 3.13 专属语法，容器 python 3.11 用
+#      --ignore-requires-python 实测可跑。
+# ---------------------------------------------------------------------------
+COPY deploy/vendor/wxchat-export /opt/wxchat-export
+#   · ffmpeg：WxAM(wxgf) 原图解码的唯一依赖 —— wxgf 容器内是标准 HEVC 码流，
+#     ffmpeg 自带原生 hevc 解码器；单帧直接转 JPEG，动画用双轨 alphamerge 合成 GIF。
+#     这一条让「原图还原」完全跑在容器内，不依赖 Windows、不依赖任何腾讯二进制。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sqlcipher gdb ffmpeg \
+ && /opt/wv-venv/bin/pip install --no-cache-dir --ignore-requires-python \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple -e /opt/wxchat-export \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# KasmVNC web 客户端端口（3000 HTTP / 3001 HTTPS）
+# 方舟 Web 界面端口 8790
+EXPOSE 8790 3000 3001

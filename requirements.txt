@@ -1,0 +1,11 @@
+# 微信数据方舟 · Web 查看器依赖（/opt/wv-venv · Python 3.11）
+#
+# 这是**唯一在每次镜像构建时从零安装**的 venv。
+# 版本已在容器内实测锁定（2026-10-02），锁定是为了构建可复现。
+# 安装入口：deploy/Dockerfile.single 第 3 段。
+#
+# 镜像源：清华 PyPI（构建环境网络直连境外 PyPI 不稳，见 Dockerfile 注释）
+
+fastapi==0.142.2
+uvicorn==0.54.0
+pydantic==2.13.5

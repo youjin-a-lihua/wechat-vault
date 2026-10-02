@@ -1,0 +1,64 @@
+services:
+  wechat-vault:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP_UID: 1000
+        APP_GID: 1001
+    image: wechat-vault:latest
+    container_name: wechat-vault
+    restart: unless-stopped
+    # 与宿主 AKI(1000:1001) 一致，SMB/文件管理器读写不会出现权限问题
+    user: "1000:1001"
+    # ── 端口绑定（项目红线：绝不开公网）──
+    #   默认只绑 NAS 的局域网 IP，不绑 0.0.0.0，也不做端口转发即可。
+    #   若只想本机用，改成 "127.0.0.1:8790:8790"。
+    #   ⚠ 不要写成 "8790:8790"——那会绑到所有网卡（含 IPv6 公网地址）。
+    ports:
+      - "${WV_BIND_IP:?请先在 deploy/.env 设置 WV_BIND_IP}:8790:8790"
+    volumes:
+      # 热数据（vol3 SSD）：整目录挂载
+      #   /data 之下即为设计文档规定的结构：
+      #     inbox/       投放口（<微信号>/ 子目录 = 一个账号；raw/ = 存档轨投放口）
+      #     media/       解码后的图片/视频
+      #     raw-snapshots/  存档轨原始包（.bak / xwechat_files 全量），按日期分代
+      #     vault.db     归档主库
+      #     MANIFEST.json 完整性指纹清单
+      - /vol3/1000/wechat-vault:/data
+      # 冷备（HC620 外接 HDD）：vol3 是它的理论缓存 → 整目录同构镜像
+      - /vol00/HSH721414ALN6M0/wechat-vault-cold:/data-cold
+    environment:
+      - TZ=Asia/Shanghai
+      # ── 热侧路径（全部落在 /data 之下）──
+      - WV_ROOT=/data
+      - WV_INBOX=/data/inbox
+      - WV_RAW_INBOX=/data/inbox/raw
+      - WV_STORE=/data
+      - WV_MEDIA=/data/media
+      - WV_RAW_SNAPSHOTS=/data/raw-snapshots
+      - WV_LOGS=/data/logs
+      # ── 冷侧路径（整目录镜像目标）──
+      - WV_COLD=/data-cold
+      - WV_SCAN_HOUR=3
+      - WV_SYNC_COLD=1
+      # 存档轨：是否把 inbox/raw 的 .bak 归入 raw-snapshots
+      - WV_ARCHIVE_RAW=1
+      # ── 访问控制（安全，默认关闭；留空则无需密码）──
+      #   生成哈希： python viewer/wv_auth.py '你的密码'
+      #   生成密钥： python viewer/wv_auth.py --secret
+      - WV_PASSWORD_HASH=${WV_PASSWORD_HASH:-}
+      - WV_SECRET=${WV_SECRET:-}
+      #   只允许这些网段访问（逗号分隔；留空 = 不限制网段，仅靠密码）
+      #   例：WV_ALLOW_CIDRS=192.168.31.0/24,192.168.100.0/24
+      - WV_ALLOW_CIDRS=${WV_ALLOW_CIDRS:-192.168.31.0/24,192.168.100.0/24,127.0.0.1/32}
+    healthcheck:
+      # ⚠ 必须打 /healthz，不能打 /api/status。
+      #   开启访问密码后 /api/status 未登录会返回 401，urlopen 抛 HTTPError，
+      #   容器将永远处于 unhealthy。
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8790/healthz',timeout=3).status==200 else 1)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

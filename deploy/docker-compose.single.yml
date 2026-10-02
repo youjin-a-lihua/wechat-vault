@@ -1,0 +1,98 @@
+# ============================================================================
+#  微信数据方舟 · 单容器一体化部署
+# ============================================================================
+#  一个容器 = 微信运行时（Xvfb + 官方微信 + KasmVNC） + 方舟本体
+#  一条命令：docker compose up -d
+#
+#  访问：
+#    方舟界面    http://<NAS_IP>:8790      ← 搜索 / 浏览 / 导出 / 安装微信
+#    微信桌面    http://<NAS_IP>:13000     ← KasmVNC（扫码登录、接手机迁移）
+#
+#  🔴 网络模式说明（2026-10-02 定稿）：
+#    host 网络 —— 手机「迁移/导入聊天记录」必需。bridge 下微信报
+#    「请保持手机和电脑在同一网络」：迁移走动态高位端口 + 局域网发现，
+#    穿不透 Docker NAT（V2EX 实测帖确认 host 模式可正常迁移）。
+#
+#  🔴 红线（绝不开公网）在 host 模式下的实现方式：
+#    · uvicorn 绑内网 IP（WV_BIND_IP，非 0.0.0.0）
+#    · KasmVNC/NGINX 设 DISABLE_IPV6=1 禁公网 IPv6 监听
+#    · 宿主无公网 IPv4（路由器 NAT 后）+ KasmVNC basic auth 双保险
+#    · ⚠️ host 模式下没有 ports 端口映射可绑，「只绑内网」改由服务级绑定实现
+# ============================================================================
+services:
+  wechat-vault:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.single
+    image: wechat-vault:single
+    container_name: wechat-vault
+    hostname: wechat-vault          # 固定主机名，配合 machine-id 降低风控
+    restart: unless-stopped
+
+    # ── host 网络：手机迁移必需（见文件头说明）──
+    network_mode: host
+
+    # linuxserver base 用 PUID/PGID 管理内部用户（abc），
+    # 不要用 compose 的 user: 指令（会破坏 s6 init）
+    environment:
+      - PUID=1000
+      - PGID=1001
+      - TZ=Asia/Shanghai
+      # ── KasmVNC 桌面 ──
+      # host 网络下服务直接监听宿主端口：13000 避开 NapCat 占用的 3000；
+      # HTTPS 13001 避开 NapCat 占用的 3001（不改会 nginx bind 失败崩溃循环）
+      - CUSTOM_PORT=13000
+      - CUSTOM_HTTPS_PORT=13001
+      - CUSTOM_USER=${WV_DESKTOP_USER:-your_user}
+      - PASSWORD=${WV_PASSWORD:?请先在 deploy/.env 设置 WV_PASSWORD}
+      # 🔴 红线加固：宿主有公网 IPv6（DDNS AAAA），禁用 v6 监听消灭公网暴露面
+      - DISABLE_IPV6=1
+      # ── 手机迁移必需 ──
+      # uvicorn 据此绑定内网 IP（host 模式下绑 0.0.0.0 会暴露全部接口）
+      - WV_BIND_IP=${WV_BIND_IP:?请先在 deploy/.env 设置 WV_BIND_IP（NAS 的 LAN 地址）}
+      # ── 方舟路径（沿用旧布局：vault.db 直接在 /data 下）──
+      - WV_ROOT=/data
+      - WV_INBOX=/data/inbox
+      - WV_RAW_INBOX=/data/inbox/raw
+      - WV_STORE=/data
+      - WV_MEDIA=/data/media
+      - WV_RAW_SNAPSHOTS=/data/raw-snapshots
+      - WV_LOGS=/data/logs
+      - WV_COLD=/data-cold
+      - WV_SCAN_HOUR=3
+      - WV_SYNC_COLD=1
+      - WV_ARCHIVE_RAW=1
+      - WV_WECHAT_HOME=/data/wechat
+      - WV_PORT=8790
+      - WV_KASMVNC_PORT=13000
+      # ── 访问控制（与旧部署同一套密码体系）──
+      - WV_PASSWORD_HASH=${WV_PASSWORD_HASH:-}
+      - WV_SECRET=${WV_SECRET:-}
+      - WV_ALLOW_CIDRS=${WV_ALLOW_CIDRS:-192.168.31.0/24,192.168.100.0/24,127.0.0.1/32}
+
+    volumes:
+      # 热数据（vol3 SSD）
+      - /vol3/1000/wechat-vault-single:/data
+      # 冷备（HC620）
+      - /vol00/HSH721414ALN6M0/wechat-vault-cold:/data-cold
+      # 微信会话 HOME（登录态/聊天库/字体配置）——容器重建不丢登录
+      - /vol3/1000/wechat-vault-single/wechat-home:/config
+
+    # 微信内嵌 CEF 需要较大共享内存，否则可能白屏/崩溃
+    shm_size: "1gb"
+    # 极简容器内运行 Qt/CEF 应用，需放宽 seccomp（WOC 同款配置）
+    security_opt:
+      - seccomp=unconfined
+    # 🔑 抓微信数据库 key 必需：gdb attach 微信进程读内存（wxchat-export 用），
+    #   无此 capability 会报 ptrace: Operation not permitted
+    cap_add:
+      - SYS_PTRACE
+
+    healthcheck:
+      # host 模式 + uvicorn 绑内网 IP：127.0.0.1 不通，用绑定 IP 探测
+      #（容器与宿主同网络栈，绑定 IP 在容器内可直接到达）
+      test: ["CMD-SHELL", "curl -fsS http://$${WV_BIND_IP}:8790/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s

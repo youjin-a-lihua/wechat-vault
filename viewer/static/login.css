@@ -1,0 +1,65 @@
+/* 登录页样式 —— 跟随微信风格，支持暗色 */
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#f7f7f7; --card:#fff; --text:#191919; --text2:#8c8c8c;
+  --line:#e2e2e2; --accent:#07c160; --input:#f2f2f2;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#111; --card:#1e1e1e; --text:#d5d5d5; --text2:#8a8a8a;
+    --line:#2e2e2e; --input:#282828;
+  }
+}
+html,body{height:100%}
+body{
+  background:var(--bg);color:var(--text);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",
+       "Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  display:flex;align-items:center;justify-content:center;
+  padding:24px;
+}
+.wrap{width:100%;max-width:360px}
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:34px 28px 26px;text-align:center;
+  box-shadow:0 10px 40px rgba(0,0,0,.07);
+}
+.logo{
+  width:62px;height:62px;border-radius:15px;background:var(--accent);
+  color:#fff;font-size:29px;font-weight:600;
+  display:flex;align-items:center;justify-content:center;
+  margin:0 auto 16px;
+}
+h1{font-size:19px;font-weight:600;letter-spacing:.5px}
+.sub{font-size:12.5px;color:var(--text2);margin-top:6px;margin-bottom:24px}
+
+.field{position:relative;margin-bottom:14px}
+.field input{
+  width:100%;height:44px;border-radius:9px;border:1px solid var(--line);
+  background:var(--input);color:var(--text);
+  font-size:14.5px;padding:0 42px 0 14px;outline:none;
+  transition:border-color .15s;
+}
+.field input:focus{border-color:var(--accent)}
+.field input::placeholder{color:var(--text2)}
+.eye{
+  position:absolute;right:12px;top:50%;transform:translateY(-50%);
+  width:19px;height:19px;fill:var(--text2);cursor:pointer;
+}
+.eye:hover{fill:var(--text)}
+
+button{
+  width:100%;height:44px;border:none;border-radius:9px;
+  background:var(--accent);color:#fff;font-size:15px;font-weight:600;
+  cursor:pointer;transition:filter .15s;
+}
+button:hover{filter:brightness(1.06)}
+button:disabled{opacity:.6;cursor:default;filter:none}
+
+.msg{
+  min-height:20px;margin-top:11px;font-size:12.5px;color:#e64340;
+}
+.tip{
+  margin-top:20px;padding-top:16px;border-top:1px solid var(--line);
+  font-size:11.5px;color:var(--text2);
+}

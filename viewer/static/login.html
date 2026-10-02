@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#ededed">
+<title>登录 · 微信数据方舟</title>
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="logo">微</div>
+    <h1>微信数据方舟</h1>
+    <p class="sub">此归档库已启用访问密码</p>
+
+    <form id="f" autocomplete="off">
+      <div class="field">
+        <input id="pw" type="password" placeholder="请输入访问密码"
+               autocomplete="current-password" autofocus>
+        <svg class="eye" id="eye" viewBox="0 0 24 24" title="显示/隐藏密码">
+          <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zm0 12.5a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/>
+        </svg>
+      </div>
+      <button type="submit" id="btn">进入</button>
+      <div id="msg" class="msg"></div>
+    </form>
+
+    <div class="tip">仅供局域网访问 · 无对外端口</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = s => document.querySelector(s);
+  const f = $('#f'), pw = $('#pw'), btn = $('#btn'), msg = $('#msg');
+
+  $('#eye').onclick = () => {
+    pw.type = pw.type === 'password' ? 'text' : 'password';
+    pw.focus();
+  };
+
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const p = pw.value;
+    if (!p) { msg.textContent = '请输入密码'; return; }
+    btn.disabled = true;
+    btn.textContent = '校验中…';
+    msg.textContent = '';
+    try {
+      const r = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: p }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.ok) {
+        btn.textContent = '成功，正在进入…';
+        location.href = '/';
+        return;
+      }
+      msg.textContent = d.detail || '登录失败';
+      if (typeof d.left === 'number' && d.left > 0)
+        msg.textContent += `（还剩 ${d.left} 次机会）`;
+      pw.value = ''; pw.focus();
+    } catch (err) {
+      msg.textContent = '网络错误：' + err.message;
+    }
+    btn.disabled = false;
+    btn.textContent = '进入';
+  };
+})();
+</script>
+</body>
+</html>

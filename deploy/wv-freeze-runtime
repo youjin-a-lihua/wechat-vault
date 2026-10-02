@@ -1,0 +1,66 @@
+#!/bin/bash
+# ============================================================================
+#  启动钩子（02）：把「运行时资产」固化到数据卷，防 recreate 丢失
+# ============================================================================
+#  背景（血泪教训）：
+#    阶段二抓微信数据库 key 需要 Python 3.12 + wxchat-export，当时是用
+#    `docker exec` 在容器可写层里临时装的（/opt/uv-pythons + /opt/wx-venv）。
+#    容器可写层在 `docker compose up -d --force-recreate` 时会被整体丢弃
+#    → 导出链路（抓 key / 解密 / 导出 JSONL）直接失效，且现象是
+#    "python 找不到"，排查成本高。
+#
+#  做法：
+#    把这两个目录搬到数据卷 /data/wx_backup/frozen/ 下（/data 是持久卷，
+#    且已在冷备范围内），启动时按需在 /opt 下重建符号链接。
+#    路径完全不变 → 所有硬编码 /opt/wx-venv/bin/python3 的脚本无需改动。
+#
+#  同时恢复：
+#    · /tmp/wxextract/workspace/plain_dbs（1.2G 解密明文库，已备份到
+#      /data/wx_backup/plain_dbs）—— /tmp 属于 overlay，recreate 即丢。
+# ============================================================================
+set -u
+
+FROZEN=/data/wx_backup/frozen
+BACKUP=/data/wx_backup
+
+# ---------------------------------------------------------------------------
+# 1) /opt 下的运行时 → 数据卷软链
+# ---------------------------------------------------------------------------
+link_one() {
+    local name="$1"
+    if [ -e "/opt/$name" ] || [ -L "/opt/$name" ]; then
+        return 0
+    fi
+    if [ ! -d "$FROZEN/$name" ]; then
+        echo "[方舟] 未找到固化资产 $FROZEN/$name，跳过 /opt/$name"
+        return 0
+    fi
+    ln -s "$FROZEN/$name" "/opt/$name"
+    echo "[方舟] 已挂载 /opt/$name -> $FROZEN/$name"
+}
+
+link_one uv-pythons
+link_one wx-venv
+
+# 导出器以 abc 身份运行，需要可读可执行
+if [ -d "$FROZEN/wx-venv" ]; then
+    chmod -R a+rX "$FROZEN/wx-venv" 2>/dev/null || true
+fi
+if [ -d "$FROZEN/uv-pythons" ]; then
+    chmod -R a+rX "$FROZEN/uv-pythons" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 2) 解密明文库回到 /tmp（导出脚本按此路径读取）
+# ---------------------------------------------------------------------------
+mkdir -p /tmp/wxextract/workspace 2>/dev/null || true
+if [ ! -e /tmp/wxextract/workspace/plain_dbs ] && [ -d "$BACKUP/plain_dbs" ]; then
+    ln -s "$BACKUP/plain_dbs" /tmp/wxextract/workspace/plain_dbs
+    echo "[方舟] 已恢复 plain_dbs -> $BACKUP/plain_dbs"
+fi
+
+# 导出中间产物目录交给 abc（导出脚本以 abc 运行）
+mkdir -p /tmp/wxextract/workspace/output 2>/dev/null || true
+chown -R abc:abc /tmp/wxextract 2>/dev/null || true
+
+exit 0

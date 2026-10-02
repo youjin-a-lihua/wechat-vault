@@ -1,0 +1,122 @@
+#!/bin/bash
+# ============================================================================
+#  微信数据方舟 · 桌面会话启动脚本
+# ============================================================================
+#  由 KasmVNC base 的 openbox 会话在桌面就绪后执行。
+#
+#  与 WOC 的 autostart 的区别：
+#    WOC：只拉起微信（等面板通知安装）
+#    方舟：拉起微信 **+ 方舟服务**（一个容器同时干两件事）
+#
+#  技术要点复用自 WOC（已验证有效）：
+#    - 强制软件渲染（容器内无 GPU）
+#    - xsettingsd 的 Xft/DPI 必须写 98304（96×1024），否则 Chromium 内核缩放因子≈0 → 黑屏
+#    - 窗口最小化看守（openbox 无任务栏，最小化后无处恢复 → 黑屏）
+#    - 崩溃转储清理（crashpad 会吃满磁盘）
+# ============================================================================
+
+set -u
+
+export LIBGL_ALWAYS_SOFTWARE=1
+export DISPLAY="${DISPLAY:-:1}"
+
+WECHAT_DIR="/data/wechat"
+WECHAT_BIN="${WECHAT_DIR}/opt/wechat/wechat"
+WV_PORT="${WV_PORT:-8790}"
+LOG_DIR="/data/logs"
+mkdir -p "${LOG_DIR}" 2>/dev/null || true
+
+log() { echo "[方舟] $*"; }
+
+# ---------------------------------------------------------------------------
+# 1) xsettingsd：让 GTK/Qt 实时响应字体/DPI 变更
+#    ⚠️ Xft/DPI 单位是「DPI × 1024」，96 DPI 必须写 98304。
+#    写错会导致所有 Chromium 内核应用缩放因子≈0 → 窗口秒关/黑屏。
+# ---------------------------------------------------------------------------
+if command -v xsettingsd >/dev/null 2>&1; then
+    XSETTINGS_CONF="/config/.xsettingsd"
+    mkdir -p "$(dirname "${XSETTINGS_CONF}")" 2>/dev/null || true
+    cat > "${XSETTINGS_CONF}" << EOF
+Xft/Antialias 1
+Xft/Hinting 1
+Xft/HintStyle "hintslight"
+Xft/RGBA "rgb"
+Xft/DPI 98304
+Gtk/FontName "Noto Sans CJK SC 10"
+EOF
+    xsettingsd --config="${XSETTINGS_CONF}" 2>/dev/null &
+    log "xsettingsd 已启动"
+fi
+
+# ---------------------------------------------------------------------------
+# 2) 窗口最小化看守：openbox 无任务栏，窗口最小化后无处恢复
+# ---------------------------------------------------------------------------
+(
+    while sleep 2; do
+        all=$(xdotool search --name '.+' 2>/dev/null) || continue
+        vis=$(xdotool search --onlyvisible --name '.+' 2>/dev/null)
+        for w in ${all}; do
+            printf '%s\n' "${vis}" | grep -qx "${w}" || xdotool windowactivate "${w}" 2>/dev/null || true
+        done
+    done
+) &
+log "最小化看守已启动"
+
+# ---------------------------------------------------------------------------
+# 3) 方舟服务（后台常驻）
+# ---------------------------------------------------------------------------
+start_vault() {
+    log "启动方舟服务 :${WV_PORT}"
+    # PYTHONPATH 必须含 /app/viewer：wv_server 内部 `import wv_auth` 是同目录导入
+    # 🔴 必须用 CLI 模式（wv_server.py --store）而非 `uvicorn viewer.wv_server:app` 模块方式：
+    #    模块方式跳过 argparse 的 load_store，方舟永远"数据尚未加载"（503 空界面）
+    # 🔴 host 网络模式：绑 WV_BIND_IP（内网 IP）而非 0.0.0.0——红线「绝不开公网」
+    PYTHONPATH="/app:/app/viewer${PYTHONPATH:+:$PYTHONPATH}" \
+    /opt/wv-venv/bin/python /app/viewer/wv_server.py \
+        --store /data --host "${WV_BIND_IP:-0.0.0.0}" --port "${WV_PORT}" \
+        >> "${LOG_DIR}/vault.log" 2>&1
+}
+(
+    while true; do
+        start_vault
+        log "方舟服务已退出，2 秒后重启"
+        sleep 2
+    done
+) &
+log "方舟服务看守已启动"
+
+# ---------------------------------------------------------------------------
+# 4) 清理微信崩溃转储（crashpad 会无限膨胀吃满磁盘）
+# ---------------------------------------------------------------------------
+if [ -d /config/.xwechat/crashinfo ]; then
+    find /config/.xwechat/crashinfo -type f -mtime +1 -delete 2>/dev/null || true
+    find /config/.xwechat/crashinfo -mindepth 1 -type d -empty -delete 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 5) 等待微信安装就绪（首次需通过方舟页面触发下载）
+# ---------------------------------------------------------------------------
+notified=0
+while [ ! -x "${WECHAT_BIN}" ]; do
+    if [ "${notified}" -eq 0 ]; then
+        log "微信尚未安装 —— 请打开方舟页面 http://<NAS_IP>:${WV_PORT} 点击「安装微信」"
+        notified=1
+    fi
+    sleep 3
+done
+log "微信已就绪: ${WECHAT_BIN}"
+
+# ---------------------------------------------------------------------------
+# 6) 常驻拉起微信（崩溃/关窗自动重启）
+# ---------------------------------------------------------------------------
+while true; do
+    if [ ! -x "${WECHAT_BIN}" ]; then
+        # 更新过程中本体被临时挪走，等就位
+        sleep 2
+        continue
+    fi
+    log "启动微信: ${WECHAT_BIN}"
+    "${WECHAT_BIN}" --no-sandbox
+    log "微信已退出，2 秒后重启"
+    sleep 2
+done
