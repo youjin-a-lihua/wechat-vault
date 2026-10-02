@@ -116,20 +116,57 @@ app = FastAPI(title="WeChat Vault", docs_url=None, redoc_url=None)
 #   未设 WV_PASSWORD_HASH → 认证关闭（本机/可信网络零摩擦）
 #   设了密码 → 除白名单外全部要求登录
 # ---------------------------------------------------------------------------
+# 认证持久化文件：首次在网页上设置的管理员密码写在这里（随数据卷持久，重启不丢）。
+# 优先级：环境变量 WV_PASSWORD_HASH / WV_SECRET > auth.json > 未初始化。
+AUTH_FILE = Path(
+    os.environ.get("WV_AUTH_FILE", "")
+    or os.path.join(os.environ.get("WV_STORE", "/data"), "auth.json")
+)
+
+
+def _load_file_auth() -> dict:
+    if AUTH_FILE.exists():
+        try:
+            return json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning("认证配置文件损坏，已忽略：%s", e)
+    return {}
+
+
+def _persist_auth(data: dict) -> None:
+    """原子写入认证配置，权限固定 0600（密码文件仅 owner 可读写）。
+
+    ⚠ fnOS 的 ZFS 上，Path.write_text 可能因 ACL 产生异常 mode（实测 0001），
+    依赖 ACL 才可读、且脆。故显式 chmod 0600 + 原子 replace。
+    """
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AUTH_FILE.with_name(AUTH_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, AUTH_FILE)
+
+
+_file_auth = _load_file_auth()
+
 AUTH = {
-    "enabled": bool(os.environ.get("WV_PASSWORD_HASH", "").strip()),
-    "hash": os.environ.get("WV_PASSWORD_HASH", "").strip(),
-    "secret": os.environ.get("WV_SECRET", "").strip() or A.gen_secret(),
+    "hash": (os.environ.get("WV_PASSWORD_HASH", "").strip()
+             or _file_auth.get("password_hash", "")),
+    "secret": (os.environ.get("WV_SECRET", "").strip()
+               or _file_auth.get("secret", "")
+               or A.gen_secret()),
     "allow_cidrs": [c for c in
                     (os.environ.get("WV_ALLOW_CIDRS", "") or "").split(",") if c.strip()],
     "throttle": A.LoginThrottle(),
+    "setup_skipped": bool(_file_auth.get("setup_skipped")),
 }
+AUTH["enabled"] = bool(AUTH["hash"])
 
 # 不需要登录即可访问的路径
 #   ⚠ 必须包含 POST /api/login 与 /api/auth —— 否则中间件会把登录请求本身拦掉
 PUBLIC_PATHS = {
     "/login", "/login.css",
     "/api/login", "/api/auth",
+    "/api/setup", "/api/setup/skip",
     "/healthz",
     "/favicon.ico", "/icon.svg",
     "/manifest.webmanifest", "/sw.js",
@@ -152,7 +189,16 @@ async def _auth_guard(req: Request, call_next):
     if path == "/healthz":
         return JSONResponse({"ok": True})
 
-    # 认证关闭 → 直通
+    # 尚未初始化（未设密码且未跳过）→ 引导到设置页
+    if not AUTH["enabled"] and not AUTH["setup_skipped"]:
+        if path in PUBLIC_PATHS:
+            return await call_next(req)
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "需要先设置访问密码", "setup": True},
+                                status_code=401)
+        return RedirectResponse("/login", status_code=302)
+
+    # 认证关闭（已跳过设置）→ 直通
     if not AUTH["enabled"]:
         return await call_next(req)
 
@@ -236,10 +282,61 @@ def api_logout():
     return resp
 
 
+@app.post("/api/setup")
+async def api_setup(req: Request):
+    """首次初始化：设置管理员密码。仅未初始化时可用。"""
+    if AUTH["enabled"]:
+        return JSONResponse({"detail": "已设置过密码"}, status_code=409)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    pw = str(body.get("password") or "")
+    if len(pw) < 8:
+        return JSONResponse({"detail": "密码至少 8 位"}, status_code=400)
+    new_hash = A.hash_password(pw)
+    new_secret = A.gen_secret()
+    try:
+        _persist_auth({"password_hash": new_hash, "secret": new_secret})
+    except OSError as e:
+        log.warning("写入认证配置文件失败：%s", e)
+        return JSONResponse({"detail": "无法写入配置文件，请检查数据目录权限"},
+                            status_code=500)
+    AUTH["hash"] = new_hash
+    AUTH["secret"] = new_secret
+    AUTH["enabled"] = True
+    token = A.make_token(AUTH["secret"])
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(A.COOKIE_NAME, token, max_age=A.TOKEN_TTL,
+                    httponly=True, samesite="lax", path="/", secure=False)
+    return resp
+
+
+@app.post("/api/setup/skip")
+async def api_setup_skip():
+    """跳过首次设置：保持无密码直进（本机/可信网络零摩擦）。"""
+    if AUTH["enabled"]:
+        return JSONResponse({"detail": "已设置过密码"}, status_code=409)
+    try:
+        data = {}
+        if AUTH_FILE.exists():
+            try:
+                data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data["setup_skipped"] = True
+        _persist_auth(data)
+    except OSError as e:
+        log.warning("写入跳过标记失败：%s", e)
+    AUTH["setup_skipped"] = True
+    return {"ok": True}
+
+
 @app.get("/api/auth")
 def api_auth():
-    """前端启动时探测是否已登录（用于渲染登出按钮）。"""
-    return {"enabled": AUTH["enabled"]}
+    """前端启动时探测认证状态：是否已启用、是否需要引导设置。"""
+    return {"enabled": AUTH["enabled"],
+            "setup": not AUTH["enabled"] and not AUTH["setup_skipped"]}
 
 
 # ---------------------------------------------------------------------------

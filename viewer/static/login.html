@@ -12,9 +12,25 @@
   <div class="card">
     <div class="logo">微</div>
     <h1>微信数据方舟</h1>
-    <p class="sub">此归档库已启用访问密码</p>
+    <p class="sub" id="sub">正在检测…</p>
 
-    <form id="f" autocomplete="off">
+    <!-- 首次设置：创建管理员密码 -->
+    <form id="setupForm" autocomplete="off" hidden>
+      <div class="field">
+        <input id="pw1" type="password" placeholder="设置访问密码（至少 8 位）"
+               autocomplete="new-password">
+      </div>
+      <div class="field">
+        <input id="pw2" type="password" placeholder="再次输入确认"
+               autocomplete="new-password">
+      </div>
+      <button type="submit" id="setupBtn">创建并进入</button>
+      <button type="button" id="skipBtn" class="ghost">暂不设置，直接进入</button>
+      <div id="setupMsg" class="msg"></div>
+    </form>
+
+    <!-- 登录 -->
+    <form id="loginForm" autocomplete="off" hidden>
       <div class="field">
         <input id="pw" type="password" placeholder="请输入访问密码"
                autocomplete="current-password" autofocus>
@@ -33,19 +49,76 @@
 <script>
 (() => {
   const $ = s => document.querySelector(s);
-  const f = $('#f'), pw = $('#pw'), btn = $('#btn'), msg = $('#msg');
 
+  const setupForm = $('#setupForm'), loginForm = $('#loginForm');
+  const sub = $('#sub');
+
+  // 启动时探测认证状态，决定显示「首次设置」还是「登录」
+  async function init() {
+    try {
+      const r = await fetch('/api/auth');
+      const d = await r.json().catch(() => ({}));
+      const setup = !!d.setup;
+      sub.textContent = setup ? '首次使用 · 设置管理员密码' : '此归档库已启用访问密码';
+      setupForm.hidden = !setup;
+      loginForm.hidden = setup;
+      if (setup) { $('#pw1').focus(); }
+    } catch (err) {
+      sub.textContent = '无法连接服务';
+    }
+  }
+
+  // ── 首次设置 ──
+  $('#setupForm').onsubmit = async e => {
+    e.preventDefault();
+    const p1 = $('#pw1').value, p2 = $('#pw2').value, msg = $('#setupMsg');
+    msg.textContent = '';
+    if (p1.length < 8) { msg.textContent = '密码至少 8 位'; return; }
+    if (p1 !== p2) { msg.textContent = '两次输入不一致'; return; }
+    const btn = $('#setupBtn');
+    btn.disabled = true; btn.textContent = '创建中…';
+    try {
+      const r = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: p1 }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.ok) {
+        btn.textContent = '完成，正在进入…';
+        location.href = '/';
+        return;
+      }
+      msg.textContent = d.detail || '设置失败';
+    } catch (err) {
+      msg.textContent = '网络错误：' + err.message;
+    }
+    btn.disabled = false; btn.textContent = '创建并进入';
+  };
+
+  // 跳过设置（保持无密码直进）
+  $('#skipBtn').onclick = async () => {
+    const btn = $('#skipBtn');
+    btn.disabled = true; btn.textContent = '处理中…';
+    try {
+      await fetch('/api/setup/skip', { method: 'POST' });
+      location.href = '/';
+    } catch (err) {
+      btn.disabled = false; btn.textContent = '暂不设置，直接进入';
+    }
+  };
+
+  // ── 登录 ──
+  const f = $('#loginForm'), pw = $('#pw'), btn = $('#btn'), msg = $('#msg');
   $('#eye').onclick = () => {
     pw.type = pw.type === 'password' ? 'text' : 'password';
     pw.focus();
   };
-
   f.onsubmit = async e => {
     e.preventDefault();
     const p = pw.value;
     if (!p) { msg.textContent = '请输入密码'; return; }
-    btn.disabled = true;
-    btn.textContent = '校验中…';
+    btn.disabled = true; btn.textContent = '校验中…';
     msg.textContent = '';
     try {
       const r = await fetch('/api/login', {
@@ -66,9 +139,10 @@
     } catch (err) {
       msg.textContent = '网络错误：' + err.message;
     }
-    btn.disabled = false;
-    btn.textContent = '进入';
+    btn.disabled = false; btn.textContent = '进入';
   };
+
+  init();
 })();
 </script>
 </body>
