@@ -8,7 +8,7 @@ WeChat Vault - 查看器后端
 
 设计原则：
   - 零常驻：只在被访问时工作，不做后台轮询
-  - 只读：绝不修改归档数据
+  - 只读：不修改归档数据
   - 局域网：默认只监听 127.0.0.1，可通过环境变量放开
   - 自带解析：依赖同仓库的 wv_parser.py
 
@@ -61,7 +61,6 @@ DEFAULT_ACCOUNT = "默认账号"
 TZ8 = dt.timezone(dt.timedelta(hours=8))
 DAY_EXPR = "date(ts, 'unixepoch', '+8 hours')"
 
-
 def _day_bounds(day: str) -> tuple[int, int]:
     """把 `YYYY-MM-DD`（东八区自然日）换算为 [lo, hi) 时间戳；非法输入返回 (0,0)。"""
     try:
@@ -71,13 +70,11 @@ def _day_bounds(day: str) -> tuple[int, int]:
     lo = int(d.replace(tzinfo=TZ8).timestamp())
     return lo, lo + 86400
 
-
 def _ts_bounds(date_from: str = "", date_to: str = "") -> tuple[int, int]:
     """起止日期（含首含尾，东八区）→ [lo, hi) 时间戳；空值表示不限。"""
     lo = _day_bounds(date_from)[0] if date_from else 0
     hi = _day_bounds(date_to)[1] if date_to else 0
     return lo, hi
-
 
 STATE: dict = {
     "data_dir": None,
@@ -87,7 +84,6 @@ STATE: dict = {
     "loading": False,
 }
 _lock = threading.Lock()
-
 
 def _setup_logging() -> None:
     """统一日志配置：级别取 WV_LOG_LEVEL（默认 INFO），已配置则不覆盖。
@@ -106,23 +102,19 @@ def _setup_logging() -> None:
         datefmt="%H:%M:%S",
     )
 
-
 _setup_logging()
 
 app = FastAPI(title="WeChat Vault", docs_url=None, redoc_url=None)
 
-# ---------------------------------------------------------------------------
-# 访问控制（项目红线：绝不开公网）
+# 访问控制（项目红线：不开公网）
 #   未设 WV_PASSWORD_HASH → 认证关闭（本机/可信网络零摩擦）
 #   设了密码 → 除白名单外全部要求登录
-# ---------------------------------------------------------------------------
 # 认证持久化文件：首次在网页上设置的管理员密码写在这里（随数据卷持久，重启不丢）。
 # 优先级：环境变量 WV_PASSWORD_HASH / WV_SECRET > auth.json > 未初始化。
 AUTH_FILE = Path(
     os.environ.get("WV_AUTH_FILE", "")
     or os.path.join(os.environ.get("WV_STORE", "/data"), "auth.json")
 )
-
 
 def _load_file_auth() -> dict:
     if AUTH_FILE.exists():
@@ -132,11 +124,10 @@ def _load_file_auth() -> dict:
             log.warning("认证配置文件损坏，已忽略：%s", e)
     return {}
 
-
 def _persist_auth(data: dict) -> None:
     """原子写入认证配置，权限固定 0600（密码文件仅 owner 可读写）。
 
-    ⚠ fnOS 的 ZFS 上，Path.write_text 可能因 ACL 产生异常 mode（实测 0001），
+    fnOS 的 ZFS 上，Path.write_text 可能因 ACL 产生异常 mode（0001），
     依赖 ACL 才可读、且脆。故显式 chmod 0600 + 原子 replace。
     """
     AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -144,7 +135,6 @@ def _persist_auth(data: dict) -> None:
     tmp.write_text(json.dumps(data, ensure_ascii=False))
     os.chmod(tmp, 0o600)
     os.replace(tmp, AUTH_FILE)
-
 
 _file_auth = _load_file_auth()
 
@@ -162,7 +152,6 @@ AUTH = {
 AUTH["enabled"] = bool(AUTH["hash"])
 
 # 不需要登录即可访问的路径
-#   ⚠ 必须包含 POST /api/login 与 /api/auth —— 否则中间件会把登录请求本身拦掉
 PUBLIC_PATHS = {
     "/login", "/login.css",
     "/api/login", "/api/auth",
@@ -172,17 +161,14 @@ PUBLIC_PATHS = {
     "/manifest.webmanifest", "/sw.js",
 }
 
-
 def _client_ip(req: Request) -> str:
     return (req.client.host if req.client else "") or ""
-
 
 @app.middleware("http")
 async def _auth_guard(req: Request, call_next):
     """统一鉴权：未登录时页面跳登录、API 回 401。"""
     path = req.url.path
 
-    # 健康检查直通：必须早于「认证开关」和「网段白名单」判断。
     # 原因：Docker healthcheck 从容器内部发起，源 IP 是容器网段（如 172.x），
     #       既不在局域网白名单里，也不会带 Cookie。若不前置，容器会永远 unhealthy。
     # 该端点不返回任何聊天数据，暴露风险为零。
@@ -220,7 +206,6 @@ async def _auth_guard(req: Request, call_next):
         return JSONResponse({"detail": "未登录", "auth": True}, status_code=401)
     return RedirectResponse("/login", status_code=302)
 
-
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
     f = STATIC_DIR / "login.html"
@@ -228,14 +213,12 @@ def login_page():
         raise HTTPException(500, "登录页缺失")
     return HTMLResponse(f.read_text(encoding="utf-8"))
 
-
 @app.get("/login.css")
 def login_css():
     f = STATIC_DIR / "login.css"
     if not f.exists():
         raise HTTPException(404, "not found")
     return FileResponse(f, media_type="text/css")
-
 
 @app.post("/api/login")
 async def api_login(req: Request):
@@ -274,13 +257,11 @@ async def api_login(req: Request):
     )
     return resp
 
-
 @app.post("/api/logout")
 def api_logout():
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(A.COOKIE_NAME, path="/")
     return resp
-
 
 @app.post("/api/setup")
 async def api_setup(req: Request):
@@ -311,7 +292,6 @@ async def api_setup(req: Request):
                     httponly=True, samesite="lax", path="/", secure=False)
     return resp
 
-
 @app.post("/api/setup/skip")
 async def api_setup_skip():
     """跳过首次设置：保持无密码直进（本机/可信网络零摩擦）。"""
@@ -331,17 +311,13 @@ async def api_setup_skip():
     AUTH["setup_skipped"] = True
     return {"ok": True}
 
-
 @app.get("/api/auth")
 def api_auth():
     """前端启动时探测认证状态：是否已启用、是否需要引导设置。"""
     return {"enabled": AUTH["enabled"],
             "setup": not AUTH["enabled"] and not AUTH["setup_skipped"]}
 
-
-# ---------------------------------------------------------------------------
 # 索引构建
-# ---------------------------------------------------------------------------
 
 def build_index(convs: list[dict], db_path: Path) -> None:
     """建立 SQLite FTS5 全文索引（trigram 分词，适合中文）。
@@ -398,7 +374,6 @@ def build_index(convs: list[dict], db_path: Path) -> None:
     conn.commit()
     conn.close()
 
-
 def load_data(data_dir: Path) -> dict:
     """加载归档目录下的全部聊天记录并建索引。
 
@@ -453,7 +428,6 @@ def load_data(data_dir: Path) -> dict:
         with _lock:
             STATE["loading"] = False
 
-
 def _db() -> sqlite3.Connection:
     path = STATE.get("index_path")
     if not path or not os.path.exists(path):
@@ -462,10 +436,7 @@ def _db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
-
-# ---------------------------------------------------------------------------
 # API
-# ---------------------------------------------------------------------------
 
 @app.get("/api/archive")
 def api_archive():
@@ -519,7 +490,6 @@ def api_archive():
         out["total_bytes"] += n_bytes
     return out
 
-
 @app.get("/api/status")
 def api_status():
     mode = STATE.get("mode", "scan")
@@ -538,14 +508,10 @@ def api_status():
         "loading": STATE["loading"],
     }
 
-
-# ---------------------------------------------------------------------------
 # 微信运行时管理（单容器一体化：安装/查看微信，接手机迁移）
-# ---------------------------------------------------------------------------
 
 WECHAT_CTL = "/woc/wechat-runtime.sh"
 WECHAT_STATUS = Path("/data/wechat/.state/status.json")
-
 
 @app.get("/api/wechat/status")
 def wechat_status():
@@ -559,7 +525,6 @@ def wechat_status():
     installed = Path("/data/wechat/opt/wechat/wechat").exists()
     return {"phase": "idle", "percent": 0, "installed": installed,
             "version": "", "message": "尚未安装" if not installed else "已安装"}
-
 
 @app.post("/api/wechat/install")
 def wechat_install(background: BackgroundTasks):
@@ -581,7 +546,6 @@ def wechat_install(background: BackgroundTasks):
     background.add_task(_run)
     return {"ok": True, "msg": "已开始下载安装微信（约 190~210MB）"}
 
-
 @app.get("/wechat-desktop")
 def wechat_desktop(req: Request):
     """跳转到本机 KasmVNC 微信桌面（自动沿用当前访问的主机名，只换端口）"""
@@ -590,7 +554,6 @@ def wechat_desktop(req: Request):
     # 宿主 3000 被 NapCat 占用，故默认不再用 3000）
     kasm = os.environ.get("WV_KASMVNC_PORT", "13000")
     return RedirectResponse(f"http://{host}:{kasm}/")
-
 
 def _ensure_schema(db: Path) -> None:
     """旧库自愈：补齐 account 等新增列，避免 `no such column: account`。
@@ -645,7 +608,6 @@ def _ensure_schema(db: Path) -> None:
         if changed:
             c.commit()
 
-
 def load_store(store_dir: Path) -> dict:
     """
     直接使用归档库（vault.db）—— 服务启动不再重建索引，秒级就绪。
@@ -685,7 +647,6 @@ def load_store(store_dir: Path) -> dict:
 
     return {"conv_count": len(convs), "msg_count": total, "mode": "store"}
 
-
 @app.post("/api/reload")
 def api_reload():
     """重新加载数据（归档器更新库后可调用，无需重启服务）。"""
@@ -699,7 +660,6 @@ def api_reload():
     _invalidate_derived_caches()
     return {"ok": True, **res}
 
-
 # 投放口路径（供 /api/ingest 使用）：默认为归档库同级的 inbox，
 # 可用环境变量 WV_INBOX 覆盖。存档轨投放口为 inbox/raw。
 def _inbox_dir() -> Path:
@@ -708,13 +668,11 @@ def _inbox_dir() -> Path:
         return Path(env)
     return Path(STATE["data_dir"]) / "inbox"
 
-
 def _raw_dirs() -> tuple[Path, Path]:
     """返回（存档轨投放口, 存档轨归档目录）。"""
     raw_in = os.environ.get("WV_RAW_INBOX") or str(_inbox_dir() / "raw")
     raw_snap = os.environ.get("WV_RAW_SNAPSHOTS") or str(Path(STATE["data_dir"]) / "raw-snapshots")
     return Path(raw_in), Path(raw_snap)
-
 
 @app.post("/api/ingest")
 def api_ingest():
@@ -780,9 +738,6 @@ def api_ingest():
             results["raw"] = {"ok": False, "error": "存档轨归档超时（>900s）"}
 
     # ③ 媒体链路：新图解密 / 消息关联 / WxAM 原图 / 视频·语音·文件
-    #    ⚠ 只跑 scan 的话，文字有了但图片仍关联不上（界面空白）。
-    #    ⚠ wv_media 依赖 pycryptodome + zstandard —— 只有 wx-venv 有；
-    #      viewer 跑在 wv-venv 上，所以必须换解释器（WV_MEDIA_PYTHON 可覆盖）。
     media_py = here / "wv_media.py"
     if media_py.is_file():
         py_media = os.environ.get("WV_MEDIA_PYTHON", "/opt/wx-venv/bin/python3")
@@ -836,7 +791,6 @@ def api_ingest():
         **res,
     }
 
-
 @app.get("/api/accounts")
 def api_accounts():
     """账号列表（多账号隔离：前端据此渲染分栏切换器）。"""
@@ -852,7 +806,6 @@ def api_accounts():
     return {"items": rows, "total": total,
             "all": {"account": "", "alias": "全部账号", "n_conv": len(STATE["convs"]),
                     "n_msg": total}}
-
 
 @app.get("/api/conversations")
 def api_conversations(
@@ -896,7 +849,6 @@ def api_conversations(
         r.setdefault("account", "")
     return {"items": rows, "total": len(rows)}
 
-
 @app.get("/api/messages")
 def api_messages(
     conv_id: str = Query(..., description="会话 ID"),
@@ -920,7 +872,6 @@ def api_messages(
         r["is_self"] = bool(r["is_self"])
     return {"conv_id": conv_id, "total": total, "offset": offset,
             "limit": limit, "has_more": offset + len(rows) < total, "items": rows}
-
 
 @app.get("/api/search")
 def api_search(
@@ -998,7 +949,6 @@ def api_search(
     return {"query": q, "count": len(hits), "total": total, "offset": offset,
             "limit": limit, "has_more": offset + len(hits) < total, "items": hits}
 
-
 @app.get("/api/calendar")
 def api_calendar(
     conv_id: str = Query("", description="限定会话（可选）"),
@@ -1008,7 +958,7 @@ def api_calendar(
     """按自然日（东八区）聚合的消息量日历 —— 「按日期查找聊天记录」用。
 
     返回逐日条数与分类计数，供前端渲染**月历**（与原生微信一致的日期速查）。
-    默认上限 4000 天（≈11 年），足够覆盖全量历史；实测全库跨度 757 天。
+    默认上限 4000 天（≈11 年），足够覆盖全量历史；全库跨度 757 天。
     """
     conds, params = ["ts IS NOT NULL"], []
     if conv_id:
@@ -1028,7 +978,6 @@ def api_calendar(
             f"SELECT MIN(ts) a, MAX(ts) b FROM msg{where}", params).fetchone()
     fmt = lambda t: dt.datetime.fromtimestamp(t, TZ8).strftime("%Y-%m-%d") if t else ""
     return {"days": days, "first": fmt(rng["a"]), "last": fmt(rng["b"])}
-
 
 @app.get("/api/locate")
 def api_locate(
@@ -1065,14 +1014,11 @@ def api_locate(
     return {"date": day, "found": True, "total": total, "day_count": day_count,
             "index": index, "seq": row["seq"], "ts": row["ts"], "msg_id": row["msg_id"]}
 
-
 _STATS_CACHE: dict[tuple, dict] = {}
-
 
 def _invalidate_derived_caches() -> None:
     """归档 / 重载后清空派生缓存（统计结果只在数据变化时失效）。"""
     _STATS_CACHE.clear()
-
 
 @app.get("/api/stats")
 def api_stats(
@@ -1081,7 +1027,7 @@ def api_stats(
 ):
     """统计报告，支持按账号过滤。
 
-    性能：原来用 6 条独立 SQL 各扫一遍 133 万行（实测冷态 7.93s）。
+    性能：原来用 6 条独立 SQL 各扫一遍 133 万行（冷态 7.93s）。
     现在 ① 把 总数/时间范围/收发比 合成一次扫描，
         ② 结果按 (conv_id, account) 缓存，归档后失效。
     """
@@ -1149,10 +1095,7 @@ def api_stats(
     _STATS_CACHE[key] = result
     return result
 
-
-# ---------------------------------------------------------------------------
 # 导出（HTML / CSV / TXT）
-# ---------------------------------------------------------------------------
 
 def _iter_convs(conv_id: str = "", account: str = ""):
     """逐会话产出「会话头 + 该会话全部消息」（生成器）。
@@ -1188,11 +1131,9 @@ def _iter_convs(conv_id: str = "", account: str = ""):
     finally:
         conn.close()
 
-
 def _fetch_convs(conv_id: str = "", account: str = "") -> list[dict]:
     """按条件取出会话 + 全部消息（保留给需要整体列表的调用方）。"""
     return list(_iter_convs(conv_id=conv_id, account=account))
-
 
 def _safe_name(s: str, limit: int = 60) -> str:
     """把会话名变成安全文件名（去路径分隔符与控制字符）。"""
@@ -1200,7 +1141,6 @@ def _safe_name(s: str, limit: int = 60) -> str:
     s = "".join("_" if c in bad else c for c in str(s or "session"))
     s = s.strip().strip(".") or "session"
     return s[:limit]
-
 
 def _dl(content: bytes | str, filename: str, mime: str,
         inline: bool = False) -> Response:
@@ -1218,7 +1158,6 @@ def _dl(content: bytes | str, filename: str, mime: str,
             "Content-Length": str(len(content)),
         },
     )
-
 
 @app.get("/api/export/conv")
 def export_conv(
@@ -1243,7 +1182,6 @@ def export_conv(
     mroot = _media_root()
     return _dl(X.conv_to_html(c, inline_media=inline_media, media_root=mroot),
                f"{name}.html", "text/html; charset=utf-8", inline=True)
-
 
 @app.get("/api/export/all")
 def export_all(
@@ -1301,7 +1239,6 @@ def export_all(
     return _dl_stream(_gen_html(), f"{name}.html",
                       "text/html; charset=utf-8", inline=True)
 
-
 @app.get("/api/export/manifest")
 def export_manifest():
     """导出会话清单（JSON），便于批量处理或做备份目录索引。
@@ -1330,7 +1267,6 @@ def export_manifest():
     return _dl(body, f"会话清单_{time.strftime('%Y%m%d')}.json",
                "application/json; charset=utf-8")
 
-
 def _dl_stream(gen, filename: str, mime: str,
                inline: bool = False) -> Response:
     """流式下载响应：逐块吐出，不把整个文件拼进内存。
@@ -1349,7 +1285,6 @@ def _dl_stream(gen, filename: str, mime: str,
                  f"{disp}; filename*=UTF-8''{quote(filename)}"},
     )
 
-
 _HTML_HEAD = (
     "<!DOCTYPE html>\n<html lang=\"zh-CN\"><head><meta charset=\"UTF-8\">"
     '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1357,7 +1292,6 @@ _HTML_HEAD = (
 _HTML_SEP = ('<div style="height:26px"></div>'
              '<div style="max-width:760px;margin:0 auto;border-top:2px dashed #ddd">'
              "</div>")
-
 
 def _merge_html(parts: list[str], title: str) -> str:
     """把多个单会话 HTML 合成一个（去掉重复的 head/body，拼 mid-body）。"""
@@ -1378,17 +1312,13 @@ def _merge_html(parts: list[str], title: str) -> str:
         + f"<script>{X._JS}</script></body></html>"
     )
 
-
 def _media_root() -> Path | None:
     store = STATE.get("data_dir")
     env = os.environ.get("WV_MEDIA")
     root = Path(env) if env else (Path(store) / "media" if store else None)
     return root
 
-
-# ---------------------------------------------------------------------------
 # 前端页面
-# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -1400,7 +1330,6 @@ def index():
     return HTMLResponse(f.read_text(encoding="utf-8"),
                         headers={"Cache-Control": "no-cache"})
 
-
 @app.get("/app.js")
 def appjs():
     f = STATIC_DIR / "app.js"
@@ -1409,7 +1338,6 @@ def appjs():
     return FileResponse(f, media_type="application/javascript",
                         headers={"Cache-Control": "no-cache"})
 
-
 @app.get("/app.css")
 def appcss():
     f = STATIC_DIR / "app.css"
@@ -1417,7 +1345,6 @@ def appcss():
         raise HTTPException(500, "前端文件缺失")
     return FileResponse(f, media_type="text/css",
                         headers={"Cache-Control": "no-cache"})
-
 
 # ── PWA ──
 
@@ -1428,7 +1355,6 @@ def service_worker():
         raise HTTPException(404, "not found")
     return FileResponse(
         f, media_type="application/javascript",
-        # SW 必须不被缓存，否则更新推不下去
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 @app.get("/manifest.webmanifest")
@@ -1438,14 +1364,12 @@ def manifest():
         raise HTTPException(404, "not found")
     return FileResponse(f, media_type="application/manifest+json")
 
-
 @app.get("/icon.svg")
 def icon():
     f = STATIC_DIR / "icon.svg"
     if not f.exists():
         raise HTTPException(404, "not found")
     return FileResponse(f, media_type="image/svg+xml")
-
 
 @app.get("/favicon.ico")
 def favicon():
@@ -1454,7 +1378,6 @@ def favicon():
     if not f.exists():
         raise HTTPException(404, "not found")
     return FileResponse(f, media_type="image/svg+xml")
-
 
 # 媒体类型映射（解码后的图片/语音/视频）
 _MEDIA_TYPES = {
@@ -1465,9 +1388,7 @@ _MEDIA_TYPES = {
     ".amr": "audio/amr", ".silk": "audio/silk", ".bin": "application/octet-stream",
 }
 
-
 _AVATAR_INDEX: dict = {}
-
 
 def _media_dir() -> Path | None:
     """媒体根目录（与归档器 WV_MEDIA 保持一致）。"""
@@ -1476,7 +1397,6 @@ def _media_dir() -> Path | None:
         return Path(env).resolve()
     store = STATE.get("data_dir")
     return (Path(store) / "media").resolve() if store else None
-
 
 def _avatar_index() -> dict:
     """显示名/wxid → 头像文件名（由 wv_media.py avatars 生成）。"""
@@ -1491,7 +1411,6 @@ def _avatar_index() -> dict:
         except Exception:
             _AVATAR_INDEX = {}
     return _AVATAR_INDEX
-
 
 @app.get("/api/avatar")
 def api_avatar(name: str = Query("", description="联系人显示名或 wxid")):
@@ -1511,7 +1430,6 @@ def api_avatar(name: str = Query("", description="联系人显示名或 wxid")):
         raise HTTPException(404, "无头像")
     mime = _MEDIA_TYPES.get(target.suffix.lower(), "image/jpeg")
     return FileResponse(target, media_type=mime)
-
 
 @app.get("/media/{rel:path}")
 def media(rel: str):
@@ -1537,10 +1455,7 @@ def media(rel: str):
     mime = _MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream")
     return FileResponse(target, media_type=mime)
 
-
-# ---------------------------------------------------------------------------
 # 入口
-# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="WeChat Vault 查看器")
@@ -1587,7 +1502,6 @@ def main():
     # 故默认提到 info；需要安静可用 WV_LOG_LEVEL=warning
     level = os.environ.get("WV_LOG_LEVEL", "info")
     uvicorn.run(app, host=args.host, port=args.port, log_level=level)
-
 
 if __name__ == "__main__":
     main()

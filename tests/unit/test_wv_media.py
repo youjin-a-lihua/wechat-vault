@@ -24,10 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 import wv_media as M
 
-
-# ---------------------------------------------------------------------------
 # 构造真实 V2 .dat 字节（密钥可自选，便于测试）
-# ---------------------------------------------------------------------------
 def make_v2_dat(plain: bytes, aes_key: bytes, xor_key: int,
                 aes_size: int = 1024) -> bytes:
     """按 V2 布局造一个合法 .dat：15 字节头 + AES头 + 固定块 + XOR尾。"""
@@ -44,9 +41,7 @@ def make_v2_dat(plain: bytes, aes_key: bytes, xor_key: int,
             + tail_xor)
     return blob
 
-
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 2000   # 合法 JPEG 头 + 填充
-
 
 class TestDecodeDat(unittest.TestCase):
     """F2 相关：固定块自检 + 正常解密 + 布局错误拒绝。"""
@@ -80,7 +75,6 @@ class TestDecodeDat(unittest.TestCase):
 
     def test_rejects_non_v2(self):
         self.assertIsNone(M.decode_dat(b"not a dat", self.key, self.xor))
-
 
 class TestFindCodePartition(unittest.TestCase):
     """F6 相关：分段对齐 256 边界，任意 workers 都不能漏扫。"""
@@ -129,7 +123,6 @@ class TestFindCodePartition(unittest.TestCase):
         for (_, hi1), (lo2, _) in zip(ranges, ranges[1:]):
             self.assertLessEqual(hi1, lo2)
 
-
 class TestStrictValidation(unittest.TestCase):
     """F2 配套：严格 JPEG 头校验能排除 AES 随机输出的假阳性。"""
 
@@ -149,7 +142,6 @@ class TestStrictValidation(unittest.TestCase):
         plain = b"\xff\xd8\xff\x99" + b"\x00" * 12
         block = AES.new(key, AES.MODE_ECB).encrypt(plain)
         self.assertFalse(M._strict_ok(block, key))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

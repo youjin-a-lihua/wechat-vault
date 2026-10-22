@@ -4,7 +4,7 @@
 WeChat Vault - 访问认证
 =======================
 
-设计目标（对应项目红线「绝不开公网」）：
+设计目标（对应项目红线「不开公网」）：
   1. 默认**关闭**，只要不设密码就是老行为（本机/可信环境零摩擦）
   2. 一旦设了密码，除白名单路径外**所有请求**都要先登录
   3. 密码只存哈希（PBKDF2-HMAC-SHA256，60 万轮 + 每密码独立随机盐）
@@ -36,10 +36,7 @@ COOKIE_NAME = "wv_session"
 MAX_FAILS = 5
 LOCK_SECONDS = 300
 
-
-# ---------------------------------------------------------------------------
 # 密码哈希
-# ---------------------------------------------------------------------------
 
 def hash_password(password: str, rounds: int = PBKDF2_ROUNDS) -> str:
     """生成 `pbkdf2_sha256$轮数$盐b64$哈希b64` 格式的密码串。"""
@@ -50,7 +47,6 @@ def hash_password(password: str, rounds: int = PBKDF2_ROUNDS) -> str:
         base64.b64encode(salt).decode("ascii"),
         base64.b64encode(dk).decode("ascii"),
     )
-
 
 def verify_password(password: str, encoded: str) -> bool:
     """校验密码。用 compare_digest 防时序攻击。"""
@@ -68,16 +64,12 @@ def verify_password(password: str, encoded: str) -> bool:
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
     return hmac.compare_digest(dk, expect)
 
-
-# ---------------------------------------------------------------------------
 # 会话令牌（无状态签名 Cookie）
-# ---------------------------------------------------------------------------
 
 def _sign(secret: bytes, payload: str) -> str:
     return base64.urlsafe_b64encode(
         hmac.new(secret, payload.encode("ascii"), hashlib.sha256).digest()
     ).decode("ascii").rstrip("=")
-
 
 def make_token(secret: str, ttl: int = TOKEN_TTL, extra: str = "") -> str:
     """生成 `过期时间戳.随机数.签名` 形式的令牌。"""
@@ -86,7 +78,6 @@ def make_token(secret: str, ttl: int = TOKEN_TTL, extra: str = "") -> str:
     payload = f"{exp}.{nonce}.{extra}"
     sig = _sign(secret.encode("utf-8"), payload)
     return f"{payload}.{sig}"
-
 
 def check_token(secret: str, token: str) -> bool:
     """校验令牌签名与有效期。"""
@@ -104,10 +95,7 @@ def check_token(secret: str, token: str) -> bool:
     except ValueError:
         return False
 
-
-# ---------------------------------------------------------------------------
 # 登录限流
-# ---------------------------------------------------------------------------
 
 class LoginThrottle:
     """简单的内存限流器：按 IP 计数失败次数。"""
@@ -132,10 +120,7 @@ class LoginThrottle:
     def reset(self, ip: str) -> None:
         self._fails.pop(ip, None)
 
-
-# ---------------------------------------------------------------------------
 # 局域网网段白名单
-# ---------------------------------------------------------------------------
 
 def _parse_cidr(cidr: str) -> tuple[int, int] | None:
     """把 `a.b.c.d/n` 或单个 IP 解析成 (网络整数, 掩码整数)。"""
@@ -160,7 +145,6 @@ def _parse_cidr(cidr: str) -> tuple[int, int] | None:
     except (ValueError, IndexError):
         return None
 
-
 def ip_in_any(ip: str, cidrs: Iterable[str]) -> bool:
     """判断 IP 是否落在任一台网内。IPv6 或解析失败一律放行（交给密码管）。"""
     nets = [n for n in (_parse_cidr(c) for c in cidrs) if n]
@@ -179,14 +163,10 @@ def ip_in_any(ip: str, cidrs: Iterable[str]) -> bool:
         return True
     return any((v & mask) == net for net, mask in nets)
 
-
 def gen_secret() -> str:
     return secrets.token_urlsafe(32)
 
-
-# ---------------------------------------------------------------------------
 # CLI：生成密码哈希
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse

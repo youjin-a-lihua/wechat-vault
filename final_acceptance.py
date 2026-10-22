@@ -32,13 +32,11 @@ PY = sys.executable
 
 PASS, FAIL = [], []
 
-
 def check(name: str, ok: bool, detail: str = "") -> bool:
     (PASS if ok else FAIL).append(name)
     mark = "PASS" if ok else "FAIL"
     print(f"  [{mark}] {name}" + (f" -- {detail}" if detail else ""))
     return ok
-
 
 def run(mod_path: Path, args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -47,14 +45,10 @@ def run(mod_path: Path, args: list[str]) -> subprocess.CompletedProcess:
         cwd=str(PROJ),
     )
 
-
 def section(t: str) -> None:
     print(f"\n{'=' * 72}\n{t}\n{'=' * 72}")
 
-
-# ---------------------------------------------------------------------------
 # A. 解析器
-# ---------------------------------------------------------------------------
 section("A. 解析器（parser/wv_parser.py）")
 # 自测：无参数调用即触发 _selftest()
 r = run(PROJ / "parser" / "wv_parser.py", [])
@@ -69,17 +63,13 @@ n_stats = out_a2.count('"top_senders"')   # 每个会话 stats 块各含一个
 check("samples 目录解析成功", r.returncode == 0 and n_stats >= 5,
       f"{n_stats} 个会话 stats 块")
 
-# ---------------------------------------------------------------------------
 # B. .dat 解码器
-# ---------------------------------------------------------------------------
 section("B. .dat 解码器（archiver/wv_dat.py）")
 r = run(PROJ / "archiver" / "wv_dat.py", ["selftest"])
 check(".dat 解码器自测通过", r.returncode == 0 and "5/5" in (r.stdout + r.stderr),
       (r.stdout.strip().splitlines() or [""])[-1][:90])
 
-# ---------------------------------------------------------------------------
 # C. 归档器（全新库 + 增量 + 校验）
-# ---------------------------------------------------------------------------
 section("C. 归档器（archiver/wv_archiver.py）")
 # 用独立临时目录，避免污染 samples/store
 tmp_root = Path(tempfile.gettempdir()) / "wv_acceptance"
@@ -138,9 +128,7 @@ check("归档库完整性校验通过", r.returncode == 0 and "失败" not in vo
       [l for l in vout.splitlines() if "通过" in l or "OK" in l or "校验" in l][:1] and
       [l for l in vout.splitlines() if "通过" in l or "OK" in l or "校验" in l][0][:80] or "")
 
-# ---------------------------------------------------------------------------
 # D. 后端 store 模式 + 全部 API（真实 HTTP）
-# ---------------------------------------------------------------------------
 section("D. 后端 API（viewer/wv_server.py，store 模式，真实 HTTP）")
 sys.path.insert(0, str(PROJ / "viewer"))
 sys.path.insert(0, str(PROJ / "parser"))
@@ -156,7 +144,6 @@ if S:
     check("后端模块可导入", True)
     t0 = time.time()
     try:
-        # 直接调用 load_store 并计时（生产模式）—— 注意必须传 Path
         S.load_store(fresh_store)
         load_t = time.time() - t0
         check("store 模式加载 < 1s", load_t < 1.0, f"{load_t*1000:.0f} ms")
@@ -231,9 +218,7 @@ if S:
     except Exception as e:
         check("TestClient 全链路", False, f"{type(e).__name__}: {e}"[:150])
 
-# ---------------------------------------------------------------------------
 # E2. 媒体解码链路（.dat → 可读图片 → HTTP 服务）
-# ---------------------------------------------------------------------------
 section("E2. 媒体解码链路（.dat → 可读图片 → HTTP）")
 media_work = tmp_root / "media"
 media_inbox = media_work / "inbox"; media_inbox.mkdir(parents=True, exist_ok=True)
@@ -296,8 +281,6 @@ try:
 except Exception as e:
     check("GET /media/... 返回正确图片", False, f"{type(e).__name__}: {e}"[:80])
 
-
-# ---------------------------------------------------------------------------
 # F. 数据一致性自审
 # ---------------------------------------------------------------------------section("F. 数据一致性自审")
 if db.exists():
@@ -360,9 +343,7 @@ if db.exists():
     print(f"\n  摘要：{total_conv} 会话 / {total_msg} 消息 / {fts_n} FTS 条目")
     conn.close()
 
-# ---------------------------------------------------------------------------
 # 结果
-# ---------------------------------------------------------------------------
 section("验收结果")
 print(f"  通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
 if FAIL:

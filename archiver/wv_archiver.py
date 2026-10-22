@@ -55,10 +55,6 @@ except Exception:  # pragma: no cover
 CST = timezone(timedelta(hours=8))
 SUPPORTED_EXT = {".csv", ".json", ".html", ".htm", ".txt"}
 
-# ---------------------------------------------------------------------------
-# 候选文件把关（2026-10-01 实测真实数据后新增）
-# ---------------------------------------------------------------------------
-# 踩过的坑：微信目录树里散落着大量 .txt，但它们**不是**聊天记录导出：
 #
 #   clash 配置     port: 7890 / socks-port: / proxies: ...      （19851f698aa.yaml.txt）
 #   json 配置      {"cache_time": 9200, "api_site": {...}}      （{(1).txt）
@@ -69,12 +65,8 @@ SUPPORTED_EXT = {".csv", ".json", ".html", ".htm", ".txt"}
 # 统计里出现「会话 01」「会话 {(1)」「会话 19851f698aa.yaml」——
 # 用户看到的是一堆垃圾，而不是聊天记录。
 #
-# 新逻辑：文件**必须自证是聊天记录**才能入库。
 
 _CHAT_TS_PAT = re.compile(
-    # 完整日期：2026-10-01 / 2026/10/1 / 2026年10月1日
-    # 注意：日期部分必须**带分隔符且数字有界**，否则 "2026年度综合工薪补贴"
-    # 会被 [年] 后的 \d{1,2} 误吞而当成时间戳（真实踩过的假阳性）。
     r"(20\d{2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,2}"
     r"|20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
     r"|20\d{2}\s*年\s*\d{1,2}\s*月(?![^\d]?\d)"      # 只到"月"也认，但不能续数字
@@ -87,7 +79,6 @@ _CONFIG_FIRST_PAT = re.compile(
     r"external-controller|proxies|proxy-groups|rules|dns|profile|"
     r"experimental|tun|sniffer|hosts|interface-name)\s*:"
 )
-
 
 def looks_like_chat_export(p: Path) -> bool:
     """
@@ -144,7 +135,6 @@ def looks_like_chat_export(p: Path) -> bool:
         first_line = text.split("\n", 1)[0].strip().strip('"')
         cols = {c.strip().strip('"').lower()
                 for c in re.split(r"[,;\t]", first_line)}
-        # 微信 4.x 官方导出的真实表头（2026-10 实测样本确认）：
         #   localId,TalkerId,Type,IsSender,CreateTime,StrTime,StrContent,NickName,Remark
         WX_COLS = {
             "localid", "talkerid", "issender", "createtime",
@@ -177,7 +167,6 @@ def looks_like_chat_export(p: Path) -> bool:
     ts = sum(1 for ln in probe if _CHAT_TS_PAT.search(ln))
     snd = sum(1 for ln in probe if _CHAT_SENDER_PAT.match(ln))
 
-    # ---- 判据（2026-10-01 经真实样本双向校准）----
     #
     # 假阳性陷阱：一份 6 行推广文恰好第 0 行以「：」结尾、第 5 行含真实日期，
     # 旧的 `ts>=1 and snd>=1` 直接放行 → 被当成会话「2026综合津贴申领步骤」。
@@ -201,14 +190,11 @@ def looks_like_chat_export(p: Path) -> bool:
         return avg_len <= 40
     return False
 
-
 # 多账号隔离：直接躺在收件箱根目录的文件归属此账号
 DEFAULT_ACCOUNT = "默认账号"
 MEDIA_EXT = {".dat", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".mp4", ".amr", ".silk", ".mp3", ".wav"}
 
-# ---------------------------------------------------------------------------
 # 数据库 schema
-# ---------------------------------------------------------------------------
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -300,10 +286,8 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-
 def now_ts() -> int:
     return int(time.time())
-
 
 def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
     """流式计算文件 SHA-256（大文件不爆内存）。"""
@@ -316,11 +300,9 @@ def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
             h.update(b)
     return h.hexdigest()
 
-
 def _existing_tables(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-
 
 def migrate_schema(conn: sqlite3.Connection, verbose: bool = False) -> list[str]:
     """把旧版本建的库原地升级到当前 schema（幂等）。
@@ -350,7 +332,6 @@ def migrate_schema(conn: sqlite3.Connection, verbose: bool = False) -> list[str]
     add_col("conv", "account", "TEXT DEFAULT ''")
     add_col("msg", "account", "TEXT DEFAULT ''")
 
-    # FTS 表若缺 account 列，必须整表重建（FTS5 不支持 ADD COLUMN）
     fts_cols = cols("msg_fts")
     if fts_cols and "account" not in fts_cols:
         conn.executescript("""
@@ -379,7 +360,6 @@ def migrate_schema(conn: sqlite3.Connection, verbose: bool = False) -> list[str]
             print(f"  [迁移] 数据库 schema 升级: {', '.join(changes)}")
     return changes
 
-
 def open_store(store_dir: str | Path, verbose: bool = False) -> sqlite3.Connection:
     """打开（必要时创建）归档库。旧库会自动原地迁移，不丢数据。"""
     store = Path(store_dir)
@@ -397,10 +377,7 @@ def open_store(store_dir: str | Path, verbose: bool = False) -> sqlite3.Connecti
     conn.commit()
     return conn
 
-
-# ---------------------------------------------------------------------------
 # 核心：增量导入
-# ---------------------------------------------------------------------------
 
 def _media_store_dir(conn: sqlite3.Connection) -> Path | None:
     """取媒体输出目录（<store>/media），由 meta 表记录 store 根。"""
@@ -408,7 +385,6 @@ def _media_store_dir(conn: sqlite3.Connection) -> Path | None:
     if not row:
         return None
     return Path(row["v"]) / "media"
-
 
 def decode_media_for_conv(conn: sqlite3.Connection, msgs: list[dict],
                           aes_key: bytes | None = None) -> int:
@@ -475,7 +451,6 @@ def decode_media_for_conv(conn: sqlite3.Connection, msgs: list[dict],
             cache[key] = None
     return n_ok
 
-
 def _account_of(conn: sqlite3.Connection, path: Path, source_root: Path | None) -> str:
     """
     从文件在收件箱中的相对路径推断所属微信号。
@@ -501,7 +476,6 @@ def _account_of(conn: sqlite3.Connection, path: Path, source_root: Path | None) 
         return DEFAULT_ACCOUNT
     return name[:64]
 
-
 def refresh_account(conn: sqlite3.Connection, account: str) -> None:
     """重算某账号的会话数 / 消息数 / 首末时间，写入 account 表。"""
     row = conn.execute(
@@ -517,7 +491,6 @@ def refresh_account(conn: sqlite3.Connection, account: str) -> None:
         "  first_seen=excluded.first_seen, last_seen=excluded.last_seen",
         (account, account, row["c"], row["m"], row["a"], row["b"]),
     )
-
 
 def import_file(conn: sqlite3.Connection, path: Path, verbose: bool = True,
                 source_root: Path | None = None) -> dict:
@@ -658,7 +631,6 @@ def import_file(conn: sqlite3.Connection, path: Path, verbose: bool = True,
         "n_added": n_added, "total": agg["n"], "dup_in_file": total_before,
     }
 
-
 def scan(conn: sqlite3.Connection, source_dir: Path, verbose: bool = True,
          exclude_dirs: tuple[str, ...] = ()) -> dict:
     """扫描目录下所有聊天记录文件并增量导入。
@@ -692,7 +664,6 @@ def scan(conn: sqlite3.Connection, source_dir: Path, verbose: bool = True,
             p = Path(root) / fn
             if p.suffix.lower() not in SUPPORTED_EXT:
                 continue
-            # ★ 把关：必须是聊天记录导出，不能是配置/网页/垃圾文本
             if not looks_like_chat_export(p):
                 rejected[p.suffix.lower()] += 1
                 continue
@@ -713,10 +684,7 @@ def scan(conn: sqlite3.Connection, source_dir: Path, verbose: bool = True,
 
     return stat
 
-
-# ---------------------------------------------------------------------------
 # MANIFEST 完整性清单
-# ---------------------------------------------------------------------------
 
 def write_manifest(conn: sqlite3.Connection, store_dir: Path) -> Path:
     """生成 MANIFEST.json：记录所有源文件的指纹，用于校验与迁移。"""
@@ -757,7 +725,6 @@ def write_manifest(conn: sqlite3.Connection, store_dir: Path) -> Path:
     out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
 
-
 def verify_manifest(conn: sqlite3.Connection, store_dir: Path, verbose: bool = True) -> dict:
     """校验源文件指纹是否仍与入库时一致（检测篡改/损坏）。"""
     rows = conn.execute("SELECT path, sha256 FROM source_file").fetchall()
@@ -784,10 +751,7 @@ def verify_manifest(conn: sqlite3.Connection, store_dir: Path, verbose: bool = T
 
     return {"ok": ok, "missing": miss, "changed": bad, "problems": problems}
 
-
-# ---------------------------------------------------------------------------
 # 冷归档搬运
-# ---------------------------------------------------------------------------
 
 def archive_move(source_dir: Path, dest_dir: Path, after_days: int = 7,
                  verbose: bool = True) -> dict:
@@ -828,10 +792,7 @@ def archive_move(source_dir: Path, dest_dir: Path, after_days: int = 7,
         print(f"搬运完成：移动 {moved} / 跳过（近期）{skipped}")
     return {"moved": moved, "skipped": skipped}
 
-
-# ---------------------------------------------------------------------------
 # 统计
-# ---------------------------------------------------------------------------
 
 def show_stats(conn: sqlite3.Connection) -> None:
     total = conn.execute("SELECT COUNT(*) FROM msg").fetchone()[0]
@@ -882,10 +843,7 @@ def show_stats(conn: sqlite3.Connection) -> None:
               f"{P.fmt_time(r['start_ts'])[:10]} ~ {P.fmt_time(r['end_ts'])[:10]}")
     print("=" * 62)
 
-
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def _setup_logging() -> None:
     """统一日志配置：级别取 WV_LOG_LEVEL（默认 INFO），已配置则不覆盖。
@@ -903,7 +861,6 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname).1s %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-
 
 def main():
     _setup_logging()
@@ -983,7 +940,6 @@ def main():
         st = M.mirror(Path(args.src), Path(args.dst), delete=not args.no_delete)
         print(f"完成：复制 {st['copied']} / 跳过 {st['skipped']} / 删除 {st['deleted']} "
               f"/ 错误 {st['errors']}（{st['bytes']} 字节）")
-
 
 if __name__ == "__main__":
     main()

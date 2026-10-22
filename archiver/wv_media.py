@@ -2,42 +2,36 @@
 # -*- coding: utf-8 -*-
 """
 微信数据方舟 · 媒体流水线（图片解密 + 消息关联 + 头像抽取）
-==========================================================
 
-背景与结论（2026-10-02 实测定稿，与公开资料交叉验证一致）
--------------------------------------------------------
 微信 4.x 的 .dat 图片是 V2 格式：
 
     [0:6)   签名 07 08 56 32 08 07
-    [6:10)  aes_size  (u32 LE，本机实测恒为 1024)
-    [10:14) xor_size  (u32 LE，= 尾部 XOR 段长度)
+    [6:10)  aes_size  (u32 LE，通常 1024)
+    [10:14) xor_size  (u32 LE，尾部 XOR 段长度)
     [14]    占位
-    [15:15+aes_size)                  AES-128-ECB 密文 → 明文「头部」
-    [15+aes_size:15+aes_size+16)      16 字节固定块（本机恒为 4b342788…afad，跳过）
-    [15+aes_size+16: +xor_size)       尾部，单字节 XOR
+    [15:15+aes_size)                AES-128-ECB 密文
+    [15+aes_size:+16)               16 字节固定块（4b342788...afad，跳过）
+    [15+aes_size+16:+xor_size)      尾部，单字节 XOR
 
-    明文 = AES_ECB_dec(头部密文, aes_key) + (尾部 XOR xor_key)
+明文 = AES_ECB_dec(头部, aes_key) + XOR(尾部, xor_key)
 
-两把密钥都是**账号级**、可离线派生，不需要扫进程内存：
+两把密钥都是账号级，可离线派生，不需要读取进程内存：
 
     xor_key = code & 0xFF
-    aes_key = md5(f"{code}{wxid}").hexdigest()[:16].encode()   # 16 字节 ASCII
+    aes_key = md5(f"{code}{wxid}").hexdigest()[:16].encode()
 
-    · xor_key 可先用缩略图（*_t.dat）尾部反推：JPEG 必以 FF D9 结尾 ⇒
-      xor_key = tail[-2] ^ 0xFF（本机得 0x42）
-    · code 满足 code & 0xFF == xor_key，用「解密后必须是合法 JPEG 头」
-      做严格校验暴力搜索即可（本机得 1*********），一次求出永久可用
+xor_key 可从缩略图（*_t.dat）尾部反推：JPEG 以 FF D9 结尾，
+即 xor_key = tail[-2] ^ 0xFF。code 满足 code & 0xFF == xor_key，
+用「解密后必须是合法 JPEG 头」做校验暴力搜索即可。
 
-消息 ↔ 图片文件的关联依据（实测 99.1% 命中）
-------------------------------------------
+消息与图片的对应关系：
     attach/<md5(chat_username)>/<YYYY-MM>/Img/*.dat
-    · 会话用户名来自 vault.msg.source_file 的 basename
-    · 同一 (chat, 时间戳) 的消息在明文库里记录了三档明文尺寸
-      （length / hdlength / cdnthumblength），与解密后明文**字节数精确相等**
-    → 用 (md5(username), 月份, 明文长度) 三元组定位文件
+    · 会话用户名取自 vault.msg.source_file 的 basename
+    · 同一 (chat, 时间戳) 在明文库里记录了三档明文尺寸
+      （length / hdlength / cdnthumblength），与解密后字节数相等
+    → 用 (md5(username), 月份, 明文长度) 定位文件
 
-用法
-----
+用法：
     python wv_media.py keys    --attach <attach目录>          # 定标并缓存密钥
     python wv_media.py decode  --attach <dir> --out <媒体目录> # 批量解密
     python wv_media.py link    --vault <vault.db> --plain-dbs <dir> --out <dir>
@@ -77,13 +71,10 @@ IMAGE_MAGIC = {
     b"GIF87a": "gif", b"GIF89a": "gif",
     b"RIFF": "webp", b"BM": "bmp", b"wxgf": "wxgf",
 }
-# JPEG 段标记：SOI 之后必须紧跟合法标记，用于严格排除 AES 随机输出撞上前缀
 JPEG_STRICT = {b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb",
                b"\xff\xd8\xff\xee", b"\xff\xd8\xff\xed", b"\xff\xd8\xff\xfe"}
 
-# ---------------------------------------------------------------------------
 # 密钥
-# ---------------------------------------------------------------------------
 
 def derive_xor_key(thumbs: list[str], sample: int = 120) -> int | None:
     """由缩略图尾部反推账号级单字节 XOR 密钥（JPEG 必以 FF D9 结尾）。"""
@@ -124,7 +115,6 @@ def _scan_worker(rng: tuple[int, int]) -> int | None:
     blocks, wxid = _SCAN["blocks"], _SCAN["wxid"]
     for code in range(lo, hi, 256):
         key = aes_key_of(code, wxid)
-        # 粗筛：首个密文块必须解出合法 JPEG 段标记
         if not _strict_ok(blocks[0], key):
             continue
         # 复核：另外两块也要通过，才排除 AES 随机输出撞前缀的假阳性
@@ -136,9 +126,8 @@ def find_code(blocks: list[bytes], wxid: str, xor_key: int,
               workers: int = 4) -> int | None:
     """暴力求 code：约束 code & 0xFF == xor_key，用严格 JPEG 头自校验。
 
-    实测（本机）：1677 万候选中唯一真解；假阳性被「三块同时通过」压到可忽略。
+    1677 万候选中唯一真解；假阳性被「三块同时通过」压到可忽略。
     """
-    # ── F6 修复：分段必须对齐 256 步长 ──
     # _scan_worker 用 range(lo, hi, 256)，要求每段起点满足 (lo & 0xFF) == xor_key。
     # 若直接 span = 2**32 // workers，当 workers 非 2 的幂时 span % 256 != 0，
     # 第 2、3 段起点会错位 → 漏扫大量候选 → 可能永远找不到正确 code。
@@ -170,7 +159,7 @@ def find_code(blocks: list[bytes], wxid: str, xor_key: int,
 def wxid_candidates(name: str) -> list[str]:
     """账号目录名 → 参与密钥派生的 wxid 候选（去重、按可能性排序）。
 
-    ── 实测（2026-10-02）：目录 `wxid_示例账号_2c37`（`_2c37` 为设备后缀）
+    ── 目录 `wxid_示例账号_2c37`（`_2c37` 为设备后缀）
     对应的正确取值是 **`wxid_示例账号`**（保留 wxid_ 下划线，仅去设备后缀）。
     不同机型/版本的后缀形式不一，故这里给出多个候选，由「能否解出合法 JPEG」
     自动判定，不写死。
@@ -233,9 +222,7 @@ def calibrate_keys(attach: str, wxid_names: list[str] | str, cache: str) -> dict
         return out
     raise SystemExit("所有 wxid 候选均未找到匹配的 code（微信可能已变更算法）")
 
-# ---------------------------------------------------------------------------
 # 解码
-# ---------------------------------------------------------------------------
 
 def decode_dat(blob: bytes, aes_key: bytes, xor_key: int) -> tuple[bytes, str] | None:
     """解一个 V2 .dat；返回 (明文, 扩展名) 或 None。"""
@@ -278,8 +265,6 @@ def _worker(path: str):
         rel = "%s/%s.%s" % (sub, md5, ext)
         dst = os.path.join(_W["out"], rel)
         if not os.path.exists(dst):
-            # ⚠️ 多进程会并发命中同一 md5（同一张图在多个会话出现）：
-            #    必须用「带 pid 的唯一临时名」再原子改名，否则第二个进程
             #    会去 rename 已被第一个进程搬走的 tmp，报 FileNotFoundError。
             try:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -313,7 +298,6 @@ def _setup_logging() -> None:
 
 _DECODE_CACHE = "_decode_cache.json"
 
-
 def _load_decode_cache(out: str) -> dict:
     """读取 .dat 解密缓存：{相对路径: {mtime,size,plain_size,rel,md5}}。
 
@@ -328,7 +312,6 @@ def _load_decode_cache(out: str) -> dict:
     except (OSError, ValueError):
         return {}
 
-
 def _save_decode_cache(out: str, files: dict) -> None:
     """原子写解密缓存（tmp + rename），避免中断写出半个文件。"""
     p = os.path.join(out, _DECODE_CACHE)
@@ -339,7 +322,6 @@ def _save_decode_cache(out: str, files: dict) -> None:
         os.replace(tmp, p)
     except OSError as e:
         log.warning("解密缓存写入失败（下次会退化为全量解密）：%s", e)
-
 
 def run_decode(attach: str, out: str, aes_key: bytes, xor_key: int,
                workers: int = 4, force: bool = False) -> dict:
@@ -427,12 +409,9 @@ def run_decode(attach: str, out: str, aes_key: bytes, xor_key: int,
     print("  索引：%d 条尺寸索引 / %d 条 md5 索引" % (len(sizemap), len(md5map)))
     return idx
 
-# ---------------------------------------------------------------------------
 # 消息关联
-# ---------------------------------------------------------------------------
 
 _PLAIN_META_CACHE: dict = {}
-
 
 def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
     """一次扫描解密明文库，同时产出两份映射（避免把 817 张表扫两遍）。
@@ -441,9 +420,8 @@ def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
       sizes_map[(chat_hash, create_time)] -> [length/hdlength/cdnthumblength, ...]
       thumb_map[(chat_hash, create_time)] -> [cdnthumblength, ...]
 
-    ⚠ 同一秒同一会话可能有多条图片消息（批量发图 / 转发多图），因此值是**列表**。
-    旧实现 `out[key] = 值` 会直接覆盖：实测 2054 个键冲突、
-    约 3780 条消息（4.9%）的尺寸信息被丢弃，导致这些图关联不上。
+    同一秒同一会话可能有多条图片消息（批量发图、转发多图），所以值是列表。
+    早期实现用 `out[key] = 值` 直接赋值，同秒多图会互相覆盖。
     """
     if plain_dbs in _PLAIN_META_CACHE:
         return _PLAIN_META_CACHE[plain_dbs]
@@ -503,11 +481,9 @@ def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
     _PLAIN_META_CACHE[plain_dbs] = (sizes_map, thumb_map)
     return sizes_map, thumb_map
 
-
 def _plain_sizes(plain_dbs: str) -> dict[tuple, list[int]]:
     """图片消息候选明文尺寸（与缩略图尺寸共用一次扫描 + 缓存）。"""
     return _plain_media_meta(plain_dbs)[0]
-
 
 def _plain_thumb_len(plain_dbs: str) -> dict[tuple, list[int]]:
     """图片消息缩略图字节数（同秒多图时一个键对应多个值）。"""
@@ -550,7 +526,6 @@ def _ct_hash_map(plain_dbs: str) -> dict:
         log.warning("联系人表读取失败，二次校正不可用：%s", e)
         return {}
     return {_h.md5(u.encode()).hexdigest() for u in names}
-
 
 def run_link(vault: str, plain_dbs: str, idx: dict) -> dict:
     """给 vault.db 的图片消息回填 media 相对路径。"""
@@ -607,9 +582,7 @@ def run_link(vault: str, plain_dbs: str, idx: dict) -> dict:
     conn.close()
     return {"images": len(rows), "linked": hit, "convs_matched": len(chash)}
 
-# ---------------------------------------------------------------------------
 # 头像
-# ---------------------------------------------------------------------------
 
 def run_avatars(plain_dbs: str, out: str) -> dict:
     """把 head_image.db 里的头像落到 <out>/avatars/<md5(username)>.<ext>，
@@ -662,9 +635,7 @@ def run_avatars(plain_dbs: str, out: str) -> dict:
     print("  头像：%d 张，索引 %d 条" % (n, len(index)))
     return {"avatars": n, "index": len(index)}
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def main():
     _setup_logging()
@@ -720,7 +691,6 @@ def main():
     if a.cmd in ("emoji", "extras") and a.plain_dbs:
         info["emoji"] = run_emoji(a.plain_dbs, a.vault, a.out)
     if a.cmd in ("avatars-fetch", "extras") and a.plain_dbs:
-        # ⚠ run_avatars_fetch 从未实现（历史遗留 CLI 入口），直接用会 NameError，
         #   把整个 extras 打断（视频/文件/语音/原图都白跑）。
         #   本地头像已由 `avatars` 从 head_image.db 落盘，该命令非必需。
         _fn = globals().get("run_avatars_fetch")
@@ -732,20 +702,14 @@ def main():
 
     print("\n完成：", json.dumps(info, ensure_ascii=False, indent=2))
 
-# ===========================================================================
-# 以下为「视频 / 文件 / 语音 / 头像联网」扩展（2026-10-02）
-# ===========================================================================
-#  各类型的关联判据（均为实测结论，详见 SKILL 与验收报告）：
 #    · 视频：msg/video/<YYYY-MM>/<hash>.mp4 + <hash>_thumb.jpg（均明文）
 #            判据 = (月份, XML 的 cdnthumblength) == 缩略图 jpg 的字节数
-#            实测 98.3% 命中；其中 45.9% 本机也留有可播放的 mp4
 #    · 文件：msg/file/<YYYY-MM>/<原始文件名>
 #            判据 = vault.content 的「[文件] xxx」与磁盘文件名相等
 #            覆盖率受限于本机实际留存的文件（809 个文件名 / 2077 条消息）
 #    · 语音：media_0.db 的 VoiceInfo.voice_data 是 SILK_V3（首字节 0x02 前缀）
 #            用 pilk 解成 PCM 再包成 WAV（浏览器可直接播）
 #            判据 = (chat_name_id → Name2Id.user_name 的 hash, create_time)
-# ===========================================================================
 
 def _month8(ts: int) -> str:
     return dt.datetime.fromtimestamp(
@@ -769,7 +733,6 @@ def run_videos(account_root: str, vault: str, out: str, plain_dbs: str = "") -> 
     upd, playable, cover_only = [], 0, 0
     zb = zstd.ZstdDecompressor()
     # 从明文库补 cdnthumblength：(hash, ct) → [缩略图长度…]
-    # ⚠ 原代码调用的是 _video_thumb_len()，而该函数**从未定义**（NameError），
     #   所以 videos / extras 一跑就崩、视频与语音关联长期失效。
     #   这里复用已实现的 _plain_thumb_len（同一份明文库扫描结果）。
     tlen = _plain_thumb_len(_plain_root(out))
@@ -927,7 +890,7 @@ def run_emoji(plain_dbs: str, vault: str, out: str,
               limit: int = 6000, workers: int = 8) -> dict:
     """表情包（动画表情）：本地不缓存 → 从消息 XML 自带的 cdnurl 下载补齐。
 
-    ── 实测（2026-10-02）：`<emoji ... md5="..." cdnurl="http://.../stodownload?m=<md5>&filekey=...">`
+    ── `<emoji ... md5="..." cdnurl="http://.../stodownload?m=<md5>&filekey=...">`
     里的 cdnurl **仍然可用**（抽样 6/6 下载成功，返回合法 GIF/PNG）。
     本地 `resource/emoticon_webp` 只有 109 个内置表情，用户收藏的表情在
     `emoticon.db` 里只有 505 条且多为远程 URL —— 所以「下载」是唯一可行路径。
@@ -1048,12 +1011,12 @@ def run_wxam(account_root: str, vault: str, out: str, workers: int = 3) -> dict:
     （内层其实是标准 HEVC 码流）。不解码时这些消息只能显示缩略图。
     ── 解码依赖：容器内 ffmpeg 的原生 hevc 解码器（无腾讯二进制、无 Windows 依赖）。
 
-    ★ 关联链（实测得出；直接用尺寸匹配 XML 的 length 是**行不通**的）：
+    关联链（直接用尺寸匹配 XML 的 length 是行不通的）：
         消息 --(会话哈希, 月份, cdnthumblength)--> `_t.dat` 的 **stem**
              --(同一 stem)--> 原图（`.dat` / `_h.dat`，可能就是 wxgf）
              --(已解码)--> media_full
-      依据：① `cdnthumblength` == `_t.dat` 明文字节数（实测命中 97.9%）
-            ② 缩略图与原图**共享同一文件名 stem**（实测 36,145 对，如 `xx.dat` / `xx_t.dat`）
+      依据：① `cdnthumblength` == `_t.dat` 明文字节数（命中 97.9%）
+            ② 缩略图与原图**共享同一文件名 stem**（36,145 对，如 `xx.dat` / `xx_t.dat`）
             ③ 而 wxgf 原图的长度**对不上** XML 的任何字段 —— 故不能用尺寸直接匹配原图
 
     落盘：`<out>/orig/<xx>/<md5>.<jpg>`（md5 取 wxgf 明文哈希，**已存在则复用**，幂等）
@@ -1214,7 +1177,6 @@ def _wx_worker(path):
             pass
     return ("orig", path, len(inner), stem, rel)
 
-
 def _plain_root(out: str = "") -> str:
     """解密明文库目录（wv_media 多处复用）。"""
     return os.environ.get("WV_PLAIN_DBS", "/data/wx_backup/plain_dbs")
@@ -1224,7 +1186,7 @@ _PSIZES_CACHE: dict = {}
 def _name_hash_map(plain_dbs: str) -> dict:
     """显示名/微信号 → md5(username)。
 
-    ── 实测（2026-10-02）：vault 里 `source_file` 的 basename 是**会话显示名**
+    ── vault 里 `source_file` 的 basename 是会话显示名
     （备注/昵称/群名），不是微信号。与 contact 的 remark/nick_name/alias/username
     比对命中 **465/469 = 99.1%**，比时间戳指纹（359/469）准得多。
     所以优先用名称直连，指纹只做兜底。
@@ -1257,7 +1219,7 @@ def _conv_hash_map(conn, rows, plain_dbs: str = "") -> dict:
     """会话 source_file 别名 → Msg_<hash>。
 
     两级策略：
-      ① 名称直连（显示名/昵称/备注/微信号 → md5(username)）—— 实测 99.1%
+      ① 名称直连（显示名/昵称/备注/微信号 → md5(username)）—— 99.1%
       ② 时间戳指纹兜底（同名冲突或非联系人会话）
     """
     root = plain_dbs or _plain_root("")
