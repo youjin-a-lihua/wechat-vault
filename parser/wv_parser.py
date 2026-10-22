@@ -52,9 +52,7 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
 # 常量
-# ---------------------------------------------------------------------------
 
 CST = timezone(timedelta(hours=8))  # 中国标准时间
 
@@ -152,20 +150,15 @@ RE_SYS_TAG = re.compile(
     r"邀请.*加入了群聊|^\w+ 撤回|加入了群聊|退出了群聊"
 )
 
-
-# ---------------------------------------------------------------------------
 # 工具函数
-# ---------------------------------------------------------------------------
 
 def norm_key(k: str) -> str:
     """表头归一化：小写、去空格下划线连字符。"""
     return re.sub(r"[\s_\-]+", "", str(k or "").strip().lower())
 
-
 def map_header(name: str) -> str | None:
     """把原始表头映射到内部字段名。"""
     return HEADER_ALIASES.get(norm_key(name))
-
 
 def parse_time(value: Any) -> tuple[int | None, str | None]:
     """尽力把任意时间表示解析为 (unix_ts, 原始字符串)。"""
@@ -201,12 +194,10 @@ def parse_time(value: Any) -> tuple[int | None, str | None]:
 
     return None, raw
 
-
 def fmt_time(ts: int | None) -> str:
     if not ts:
         return ""
     return datetime.fromtimestamp(ts, CST).strftime("%Y-%m-%d %H:%M:%S")
-
 
 def to_bool(v: Any) -> bool:
     """把各种"是否本人"的表示统一成 bool。"""
@@ -216,7 +207,6 @@ def to_bool(v: Any) -> bool:
         return v == 1
     s = str(v or "").strip().lower()
     return s in {"1", "true", "yes", "y", "self", "me", "是", "本人", "我", "发送"}
-
 
 def infer_type(content: str, given_type: Any = None) -> str:
     """推断消息类型：优先用给定类型，其次从内容里的 [标签] 推断。"""
@@ -241,14 +231,12 @@ def infer_type(content: str, given_type: Any = None) -> str:
         return "system"
     return "text"
 
-
 def make_msg_id(source: str, conv: str, seq: int, ts: int | None, content: str) -> str:
     """生成稳定唯一 ID（同样输入 → 同样 ID，便于增量去重）。"""
     h = hashlib.sha1(
         f"{source}|{conv}|{seq}|{ts}|{content[:200]}".encode("utf-8", "ignore")
     ).hexdigest()[:12]
     return f"{source}-{h}"
-
 
 def clean_text(s: Any) -> str:
     """清理文本：去首尾空白，统一换行。"""
@@ -257,10 +245,7 @@ def clean_text(s: Any) -> str:
     t = str(s).replace("\r\n", "\n").replace("\r", "\n")
     return t.strip()
 
-
-# ---------------------------------------------------------------------------
 # 各格式解析器
-# ---------------------------------------------------------------------------
 
 def parse_csv(path: str) -> list[dict]:
     """解析 CSV（WeChatMsg / PyWxDump 风格，支持表头别名）。"""
@@ -322,7 +307,6 @@ def parse_csv(path: str) -> list[dict]:
         rows.append(rec)
     return rows
 
-
 def parse_json(path: str) -> list[dict]:
     """解析 JSON（WeChatMsg 风格 / 通用数组 / 对象包裹）。"""
     with open(path, "r", encoding="utf-8-sig") as f:
@@ -353,7 +337,6 @@ def parse_json(path: str) -> list[dict]:
         # 未映射到的字段也保留在 raw 里
         rows.append(rec)
     return rows
-
 
 def parse_html(path: str) -> list[dict]:
     """
@@ -399,7 +382,6 @@ def parse_html(path: str) -> list[dict]:
     # --- 兜底：按文本行解析 ---
     return parse_html_as_text(html)
 
-
 def _extract_from_block(block: str) -> dict:
     """从一个消息块里抽取字段。"""
     rec: dict = {"raw": {}}
@@ -437,7 +419,6 @@ def _extract_from_block(block: str) -> dict:
     rec["raw"]["block"] = True
     return rec
 
-
 def parse_html_as_text(html: str) -> list[dict]:
     """兜底：把 HTML 当纯文本，用时间戳切分消息。"""
     # 去 script/style
@@ -446,7 +427,6 @@ def parse_html_as_text(html: str) -> list[dict]:
     html = re.sub(r"</(?:div|p|li|tr|h\d)>", "\n", html, flags=re.I)
     text = re.sub(r"<[^>]+>", "", html)
     return parse_txt_text(text)
-
 
 def parse_txt(path: str) -> list[dict]:
     """解析 TXT。"""
@@ -463,7 +443,6 @@ def parse_txt(path: str) -> list[dict]:
         raise ValueError(f"无法解码 TXT 文件: {path}")
     return parse_txt_text(text)
 
-
 # 时间戳片段（供多种布局复用）
 _T_FULL = r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?\s+\d{1,2}:\d{2}(?::\d{2})?"
 _T_MDHM = r"\d{1,2}[-/月]\d{1,2}[日]?\s+\d{1,2}:\d{2}(?::\d{2})?"
@@ -477,9 +456,6 @@ TIME_LINE_PATTERNS = [
 ]
 
 # 「发送者 + 分隔符 + 时间戳」在**行首**的格式（微信导出常见）
-#   张三\t2026-10-01 20:15:00
-#   张三  2026/10/1 20:15
-#   张三, 2026-10-01 20:15:00
 # 要求发送者较短且不含冒号/标点，避免误吃普通正文。
 SENDER_TIME_PATTERNS = [
     re.compile(r"^\s*([^\t:：,，|]{1,24})[\t]+(" + _T_FULL + r"|" + _T_MDHM + r"|" + _T_HM + r")\s*$"),
@@ -492,10 +468,8 @@ TAIL_TIME_SENDER = re.compile(
     r"^(.*?)\s*[\[\(]?(" + _T_FULL + r"|" + _T_MDHM + r")[\]\)]?\s*$"
 )
 
-
 # 最近一次 TXT 解析识别出的会话标题（由 parse_txt_text 写入，parse_file 读取）
 LAST_TITLE_HINT: str | None = None
-
 
 def parse_txt_text(text: str) -> list[dict]:
     """
@@ -553,7 +527,6 @@ def parse_txt_text(text: str) -> list[dict]:
         matched = False
 
         # ---- ① 行首「发送者 + 分隔符 + 时间戳」（微信导出常见）----
-        #      注意：必须先于纯时间模式尝试，否则 "张三\t20:15" 会被误判
         for pat in SENDER_TIME_PATTERNS:
             m = pat.match(s)
             if m:
@@ -612,10 +585,7 @@ def parse_txt_text(text: str) -> list[dict]:
     LAST_TITLE_HINT = title_hint
     return rows
 
-
-# ---------------------------------------------------------------------------
 # 统一装配
-# ---------------------------------------------------------------------------
 
 def sniff_format(path: str) -> str:
     """嗅探文件格式。"""
@@ -645,7 +615,6 @@ def sniff_format(path: str) -> str:
         pass
     return "txt"
 
-
 def normalize_rows(rows: Iterable[dict], source: str, conv_id: str) -> list[dict]:
     """把各格式的原始行统一为标准消息结构。"""
     out: list[dict] = []
@@ -663,7 +632,6 @@ def normalize_rows(rows: Iterable[dict], source: str, conv_id: str) -> list[dict
             tstr = fmt_time(ts) if ts else (tstr or "")
 
         # 关键：来源提供的 ID（如 CSV 的 localId）只在单个会话内唯一，
-        # 因此必须拼接 conv_id 前缀 + 格式，保证全局唯一，避免跨会话主键冲突。
         raw_id = str(r.get("msg_id") or "").strip()
         if raw_id:
             msg_id = f"{source}:{conv_id}:{raw_id}"
@@ -684,7 +652,6 @@ def normalize_rows(rows: Iterable[dict], source: str, conv_id: str) -> list[dict
         }
         out.append(msg)
     return out
-
 
 def build_stats(messages: list[dict]) -> dict:
     """计算会话统计。"""
@@ -707,7 +674,6 @@ def build_stats(messages: list[dict]) -> dict:
         "types": types,
         "top_senders": sorted(senders.items(), key=lambda x: -x[1])[:20],
     }
-
 
 def parse_file(path: str, conv_id: str | None = None) -> dict:
     """解析单个文件 → 标准会话结构。"""
@@ -740,7 +706,6 @@ def parse_file(path: str, conv_id: str | None = None) -> dict:
         "stats": build_stats(messages),
     }
 
-
 def parse_dir(dirpath: str) -> list[dict]:
     """批量解析目录下所有可识别文件。"""
     exts = {".csv", ".json", ".html", ".htm", ".txt"}
@@ -766,10 +731,7 @@ def parse_dir(dirpath: str) -> list[dict]:
                 })
     return out
 
-
-# ---------------------------------------------------------------------------
 # 命令行自测
-# ---------------------------------------------------------------------------
 
 def _selftest():
     """内置自测：用合成样本验证四种格式解析器。"""
@@ -823,7 +785,6 @@ def _selftest():
             ok += 1
     print(f"\n自测结果：{ok}/{len(samples)} 种格式解析成功")
     return ok == len(samples)
-
 
 if __name__ == "__main__":
     import sys

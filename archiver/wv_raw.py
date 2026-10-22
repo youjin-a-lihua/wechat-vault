@@ -53,20 +53,16 @@ CST = timezone(timedelta(hours=8))
 RAW_EXTS = {".bak", ".db", ".zip", ".tar", ".gz", ".7z", ".rar", ".dat", ".bin"}
 
 # 这些文件名（不论扩展名）一律视为存档轨内容 —— 微信备份包的组成部分。
-# 实测：Windows 微信「备份与恢复」产生的是一组**无扩展名**文件：
 #   Backup.db  BAK_0_TEXT  BAK_0_MEDIA  BAK_1_TEXT  BAK_1_MEDIA ...
 RAW_FILENAMES = {"backup.db", "bak_0_text", "bak_0_media"}
 
-# 无扩展名但必须收的文件名前缀（微信备份包分片）
 RAW_NAME_PREFIXES = ("bak_",)
 
 # 跳过项：隐藏/临时/占位
 _SKIP_PREFIX = (".", "~$", "_")
 
-
 def now_ts() -> int:
     return int(time.time())
-
 
 def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     """流式计算 SHA-256（大文件不爆内存）。"""
@@ -78,7 +74,6 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
                 break
             h.update(b)
     return h.hexdigest()
-
 
 def _is_raw_candidate(p: Path) -> bool:
     """是否属于存档轨处理范围。"""
@@ -94,7 +89,6 @@ def _is_raw_candidate(p: Path) -> bool:
     # ② 常见归档/库文件扩展名
     return p.suffix.lower() in RAW_EXTS
 
-
 def _load_index(dest: Path) -> dict:
     idx = dest / "archive-index.json"
     if idx.is_file():
@@ -105,13 +99,11 @@ def _load_index(dest: Path) -> dict:
             pass
     return {"version": "1.0", "generations": [], "files": []}
 
-
 def _save_index(dest: Path, data: dict) -> Path:
     data["updated_at"] = datetime.now(CST).isoformat()
     out = dest / "archive-index.json"
     out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
-
 
 def _merge_manifest(manifest_path: Path, raw_files: list[dict], dest: Path) -> None:
     """把存档轨文件并入主 MANIFEST.json（若存在），保持单一完整性清单。"""
@@ -135,7 +127,6 @@ def _merge_manifest(manifest_path: Path, raw_files: list[dict], dest: Path) -> N
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                              encoding="utf-8")
-
 
 def ingest(source: Path, dest: Path, manifest_path: Path | None = None,
            verbose: bool = True, day: str | None = None) -> dict:
@@ -187,7 +178,7 @@ def ingest(source: Path, dest: Path, manifest_path: Path | None = None,
 
             gen_dir.mkdir(parents=True, exist_ok=True)
             target = gen_dir / p.name
-            # 同名不同内容 → 加指纹后缀，绝不覆盖
+            # 同名不同内容 → 加指纹后缀，不覆盖
             if target.exists():
                 target = gen_dir / f"{p.stem}_{fhash[:8]}{p.suffix}"
 
@@ -238,7 +229,6 @@ def ingest(source: Path, dest: Path, manifest_path: Path | None = None,
               f"（{stat['bytes']/1048576:.1f} MB）")
     return stat
 
-
 def list_generations(dest: Path) -> dict:
     """列出现有存档代与内容。"""
     idx = _load_index(dest)
@@ -254,7 +244,6 @@ def list_generations(dest: Path) -> dict:
                             "files": [x["path"] for x in v]}
                         for g, v in sorted(by_gen.items())},
     }
-
 
 def verify(dest: Path, verbose: bool = True) -> dict:
     """校验存档轨完整性：逐文件重算 SHA-256 与索引比对。"""
@@ -278,7 +267,6 @@ def verify(dest: Path, verbose: bool = True) -> dict:
         for x in problems[:20]:
             print("   ", x)
     return {"ok": ok, "missing": miss, "changed": bad, "problems": problems}
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="WeChat Vault 存档轨归档器（双轨制）")
@@ -326,7 +314,6 @@ def main() -> int:
         return 0 if (r["missing"] == 0 and r["changed"] == 0) else 2
 
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

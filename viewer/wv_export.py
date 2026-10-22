@@ -37,7 +37,6 @@ TYPE_LABEL = {
     "system": "系统", "other": "其他",
 }
 
-
 def _fmt_time(ts) -> str:
     if not ts:
         return ""
@@ -46,7 +45,6 @@ def _fmt_time(ts) -> str:
     except Exception:
         return ""
 
-
 def _fmt_day(ts) -> str:
     if not ts:
         return ""
@@ -54,7 +52,6 @@ def _fmt_day(ts) -> str:
         return time.strftime("%Y年%m月%d日", time.localtime(int(ts)))
     except Exception:
         return ""
-
 
 def _display(m: dict) -> str:
     """把一条消息渲染成可读文本（媒体类给中文占位）。"""
@@ -65,10 +62,7 @@ def _display(m: dict) -> str:
     label = TYPE_LABEL.get(t, t)
     return f"[{label}]" + (f" {content}" if content else "")
 
-
-# ---------------------------------------------------------------------------
 # CSV
-# ---------------------------------------------------------------------------
 
 def conv_to_csv(conv: dict) -> bytes:
     """单会话 → CSV（Excel 友好，带 BOM）。"""
@@ -85,7 +79,6 @@ def conv_to_csv(conv: dict) -> bytes:
             (m.get("media") or ""),
         ])
     return buf.getvalue().encode("utf-8-sig")
-
 
 def convs_to_csv(convs: list[dict]) -> bytes:
     """多会话 → 单个 CSV（多出「账号」「会话」两列）。"""
@@ -107,10 +100,7 @@ def convs_to_csv(convs: list[dict]) -> bytes:
             ])
     return buf.getvalue().encode("utf-8-sig")
 
-
-# ---------------------------------------------------------------------------
 # TXT
-# ---------------------------------------------------------------------------
 
 def conv_to_txt(conv: dict) -> bytes:
     title = conv.get("title") or conv.get("conv_id") or "会话"
@@ -139,10 +129,7 @@ def conv_to_txt(conv: dict) -> bytes:
         lines.append(f"[{hm}] {sender}: {_display(m)}")
     return ("\n".join(lines) + "\n").encode("utf-8")
 
-
-# ---------------------------------------------------------------------------
 # HTML（单文件，可直接打印成 PDF）
-# ---------------------------------------------------------------------------
 
 _CSS = """
 *{margin:0;padding:0;box-sizing:border-box}
@@ -210,18 +197,15 @@ document.addEventListener('click', e => {
 _AV_COLORS = ['#5b8ff9', '#61ddaa', '#65789b', '#f6bd16', '#7262fd',
               '#78d3f8', '#9661bc', '#f6903d', '#008685', '#f08bb4']
 
-
 def _av_color(name: str) -> str:
     h = 0
     for ch in str(name):
         h = (h * 31 + ord(ch)) & 0xFFFFFFFF
     return _AV_COLORS[h % len(_AV_COLORS)]
 
-
 def _initial(name: str) -> str:
     s = str(name or "?").strip()
     return s[0].upper() if s else "?"
-
 
 def _media_html(m: dict, inline_media: bool, media_root: Path | None) -> str:
     rel = (m.get("media") or "").strip()
@@ -252,7 +236,6 @@ def _media_html(m: dict, inline_media: bool, media_root: Path | None) -> str:
     if t == "video":
         return f'<video controls preload="none" src="{html.escape(src)}"></video>'
     return f'<a href="{html.escape(src)}" target="_blank">下载附件</a>'
-
 
 def conv_to_html(conv: dict, inline_media: bool = False,
                  media_root: Path | None = None,
@@ -327,7 +310,6 @@ def conv_to_html(conv: dict, inline_media: bool = False,
         "</body></html>",
     ]
     return "".join(parts)
-
 
 def index_html(convs: list[dict], title: str = "聊天记录导出") -> str:
     """多会话 → 一个总览页，链接到各会话（用于打包导出）。"""

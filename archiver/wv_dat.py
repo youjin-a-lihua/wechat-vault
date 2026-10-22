@@ -43,9 +43,7 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
 # 文件头签名
-# ---------------------------------------------------------------------------
 
 SIGNATURES = [
     (b"\xff\xd8\xff", ".jpg",  "jpg"),
@@ -73,7 +71,6 @@ SIGNATURES = [
 ]
 
 # V1 固定密钥（公开已知）
-# ⚠️ 修正（2026-10-01）：原值 "cfcd208495d565ef" 只有 8 字节，
 #    被送进 AES-128 会在密钥扩展阶段直接抛异常。
 #    AES-128 需要 **16 字节**密钥。
 #    已知的微信 V1 固定密钥为 md5("0") 的十六进制串，共 32 个字符 = 16 字节。
@@ -85,8 +82,6 @@ V1_MAGIC = b"\x07\x08"
 V2_MAGIC_A = b"\x07\x08"
 V2_MAGIC_B = b"\x08\x07"
 
-# ---------------------------------------------------------------------------
-# 关键修正（2026-10-01 实测真实微信数据后得出）：
 #
 # 微信 for Windows 4.x（2026）落盘的 .dat 绝大多数是 Old XOR 单字节异或，
 # 其**首个字节完全随机**，因此前两字节撞上 V1_MAGIC(b"\x07\x08") 纯属概率事件
@@ -95,9 +90,7 @@ V2_MAGIC_B = b"\x08\x07"
 # 旧实现只看前 2 字节就判定 V1，导致这些 Old XOR 文件被误送进 AES 分支，
 # 进而触发 _expand_key 越界崩溃。修正原则：
 #
-#   **AES 分支必须"自证清白"** —— 解出来的首块必须能匹配已知媒体签名，
-#   否则视为误判，回退到 XOR 嗅探。绝不因为 magic 长得像就盲跳。
-# ---------------------------------------------------------------------------
+#   否则视为误判，回退到 XOR 嗅探。不要因为 magic 长得像就盲跳。
 
 def _looks_like_aes_v1v2(head: bytes) -> bool:
     """
@@ -118,22 +111,18 @@ def _looks_like_aes_v1v2(head: bytes) -> bool:
         return False
     return True
 
-
-# ---------------------------------------------------------------------------
 # 基础工具
-# ---------------------------------------------------------------------------
 
 def xor_bytes(data: bytes | bytearray, key: int) -> bytes:
     """整块单字节 XOR。"""
     return bytes(b ^ key for b in data)
-
 
 def detect_xor_key(head: bytes) -> tuple[int, str] | None:
     """
     嗅探 Old XOR 格式的密钥：遍历 0..255，看哪个能让文件头匹配已知格式。
     返回 (key, ext) 或 None。
 
-    ⚠️ 重要警告（2026-10-01 真实数据实测后加）：
+    注意：
 
         本函数**对微信 4.x 的 .dat 恒返回假阳性**，不可单独作为判据！
 
@@ -142,7 +131,7 @@ def detect_xor_key(head: bytes) -> tuple[int, str] | None:
             key = 0x07 ^ 0x42 = 0x45   ← 对每个文件都一样
         于是 100% "命中"、ext 恒为 .bmp —— 但 XOR 之后
         BITMAPFILEHEADER 的 fsize/off/hdrsize/dim/planes/bpp 全是垃圾。
-        实测 226 个真实样本：命中率 100%，强校验通过率 0%。
+        226 个真实样本里：命中率 100%，强校验通过率 0%。
 
         因此**调用方必须用 strong_validate() 复核**，不能只看本函数返回值。
         decode_dat() 已按此修正。
@@ -160,10 +149,7 @@ def detect_xor_key(head: bytes) -> tuple[int, str] | None:
             return key, ext
     return None
 
-
-# ---------------------------------------------------------------------------
 # 强校验：完整文件结构合法性（区别于只看 magic 的"弱校验"）
-# ---------------------------------------------------------------------------
 
 def _bmp_strong(buf: bytes) -> bool:
     """校验完整 BITMAPFILEHEADER + BITMAPINFOHEADER。"""
@@ -185,20 +171,16 @@ def _bmp_strong(buf: bytes) -> bool:
             and planes == 1
             and bpp in (1, 4, 8, 16, 24, 32))
 
-
 def _jpg_strong(buf: bytes) -> bool:
     return (len(buf) > 4 and buf[:2] == b"\xff\xd8" and buf[-2:] == b"\xff\xd9")
-
 
 def _png_strong(buf: bytes) -> bool:
     return (buf.startswith(b"\x89PNG\r\n\x1a\n")
             and b"IHDR" in buf[:32]
             and buf[-8:-4] == b"IEND")
 
-
 def _gif_strong(buf: bytes) -> bool:
     return buf[:6] in (b"GIF87a", b"GIF89a") and buf[-1:] == b"\x3b"
-
 
 _STRONG = {
     ".bmp": _bmp_strong,
@@ -206,7 +188,6 @@ _STRONG = {
     ".png": _png_strong,
     ".gif": _gif_strong,
 }
-
 
 def strong_validate(buf: bytes, ext: str = "") -> bool:
     """
@@ -237,7 +218,6 @@ def strong_validate(buf: bytes, ext: str = "") -> bool:
             continue
     return False
 
-
 def identify(data: bytes) -> tuple[str, str] | None:
     """识别明文数据的格式，返回 (ext, name) 或 None。"""
     for sig, ext, name in SIGNATURES:
@@ -249,10 +229,6 @@ def identify(data: bytes) -> tuple[str, str] | None:
             return ext, name
     return None
 
-
-# ---------------------------------------------------------------------------
-# 元数据类 .dat（非媒体）—— 2026-10 实测真实数据后新增
-# ---------------------------------------------------------------------------
 # 微信把一批非媒体的状态文件也命名成 .dat，与图片/视频 .dat 混在同一棵树里。
 _META_DAT_STEMS = frozenset({
     "alt_name", "detail", "phoneid", "backup_time", "phone_history",
@@ -263,12 +239,11 @@ _META_DAT_NAMES = frozenset(f"{s}.dat" for s in _META_DAT_STEMS) | frozenset({
     "backup.attr", "backup_time.dat",
 })
 
-
 def is_metadata_dat(path_or_name) -> bool:
     """
     判断是否为**元数据类** .dat（非媒体，不应送进图片解码器）。
 
-    实测样本（D:\\ 与 G:\\ 两代数据都有）：
+    样本（两代数据都有）：
         alt_name.dat         会话别名表
         detail.dat           设备详情
         phoneid.dat          手机标识
@@ -284,12 +259,11 @@ def is_metadata_dat(path_or_name) -> bool:
     stem = name[:-4] if name.endswith(".dat") else name
     return stem in _META_DAT_STEMS
 
-
 def is_media_dat(path_or_name) -> bool:
     """
     判断是否**大概率是媒体** .dat。
 
-    实测真实命名规律（wxid_*/msg/attach/<hash>/<YYYY-MM>/Img/）：
+    真实命名规律：wxid_*/msg/attach/<hash>/<YYYY-MM>/Img/
         <md5>.dat        原图
         <md5>_t.dat      缩略图（thumb）
         <md5>_h.dat      高清（hd）
@@ -300,10 +274,7 @@ def is_media_dat(path_or_name) -> bool:
     """
     return not is_metadata_dat(path_or_name)
 
-
-# ---------------------------------------------------------------------------
 # AES-128-ECB（V1 / V2）
-# ---------------------------------------------------------------------------
 
 def _aes_ecb_decrypt(block: bytes, key: bytes) -> bytes:
     """
@@ -320,7 +291,6 @@ def _aes_ecb_decrypt(block: bytes, key: bytes) -> bytes:
         log.warning("pycryptodome 缺失，AES 解密不可用，.dat 将无法解码：%s", e)
         pass
     return _aes128_ecb_decrypt_pure(block, key)
-
 
 # ---- 最小 AES-128 实现（仅 ECB 解密，供无 pycryptodome 环境使用）----
 
@@ -350,11 +320,9 @@ _INV_SBOX = bytes(_INV_SBOX)
 
 _RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36]
 
-
 def _xtime(a: int) -> int:
     a <<= 1
     return (a ^ 0x1B) & 0xFF if a & 0x100 else a
-
 
 def _mul(a: int, b: int) -> int:
     r = 0
@@ -364,7 +332,6 @@ def _mul(a: int, b: int) -> int:
         b >>= 1
         a = _xtime(a)
     return r
-
 
 def _expand_key(key: bytes) -> list[list[int]]:
     """AES-128 密钥扩展 → 11 轮密钥（每轮 16 字节）。"""
@@ -385,11 +352,9 @@ def _expand_key(key: bytes) -> list[list[int]]:
         w.append([w[i - 4][j] ^ temp[j] for j in range(4)])
     return [sum(w[r * 4:r * 4 + 4], []) for r in range(11)]
 
-
 def _add_round_key(state: list[int], rk: list[int]) -> None:
     for i in range(16):
         state[i] ^= rk[i]
-
 
 def _inv_shift_rows(s: list[int]) -> None:
     # 状态按列主序：s[c*4+r]
@@ -399,11 +364,9 @@ def _inv_shift_rows(s: list[int]) -> None:
         for c in range(4):
             s[c * 4 + r] = row[c]
 
-
 def _inv_sub_bytes(s: list[int]) -> None:
     for i in range(16):
         s[i] = _INV_SBOX[s[i]]
-
 
 def _inv_mix_columns(s: list[int]) -> None:
     for c in range(4):
@@ -412,7 +375,6 @@ def _inv_mix_columns(s: list[int]) -> None:
         s[c * 4 + 1] = _mul(a[0], 9) ^ _mul(a[1], 14) ^ _mul(a[2], 11) ^ _mul(a[3], 13)
         s[c * 4 + 2] = _mul(a[0], 13) ^ _mul(a[1], 9) ^ _mul(a[2], 14) ^ _mul(a[3], 11)
         s[c * 4 + 3] = _mul(a[0], 11) ^ _mul(a[1], 13) ^ _mul(a[2], 9) ^ _mul(a[3], 14)
-
 
 def _aes128_ecb_decrypt_pure(data: bytes, key: bytes) -> bytes:
     """纯 Python AES-128-ECB 解密（仅支持正好整块的数据）。"""
@@ -432,10 +394,7 @@ def _aes128_ecb_decrypt_pure(data: bytes, key: bytes) -> bytes:
         out.extend(block)
     return bytes(out)
 
-
-# ---------------------------------------------------------------------------
 # 三代格式解码
-# ---------------------------------------------------------------------------
 
 def decrypt_v1v2(blob: bytes, aes_key: bytes) -> bytes:
     """
@@ -456,12 +415,11 @@ def decrypt_v1v2(blob: bytes, aes_key: bytes) -> bytes:
     # 若首块仍不匹配，尝试单字节 XOR 嗅探
     return dec
 
-
 def _try_v1v2(data: bytes, key: bytes) -> tuple[bytes, str] | None:
     """
     尝试用给定 AES 密钥解出 V1/V2，成功则返回 (明文, ext)。
 
-    ⚠️ 判据用 strong_validate（完整结构），不用 identify（仅 magic），
+    判据用 strong_validate（完整结构），不用 identify（仅 magic），
     避免 AES 解出随机字节恰好撞上 magic 的假阳性。
     """
     dec = decrypt_v1v2(data, key)
@@ -479,7 +437,6 @@ def _try_v1v2(data: bytes, key: bytes) -> tuple[bytes, str] | None:
             return plain, ext2
     return None
 
-
 def strong_validate_ext(buf: bytes) -> str | None:
     """强校验并返回扩展名（内部辅助）。"""
     if not buf or len(buf) < 16:
@@ -493,7 +450,6 @@ def strong_validate_ext(buf: bytes) -> str | None:
             continue
     return None
 
-
 def decode_dat(blob: bytes, aes_key: bytes | None = None) -> dict:
     """
     解码一个 .dat 的字节内容。
@@ -501,13 +457,13 @@ def decode_dat(blob: bytes, aes_key: bytes | None = None) -> dict:
     返回 {'ok': bool, 'fmt': 'plain'|'xor'|'v1'|'v2'|'tmp', 'data': bytes,
           'ext': str, 'detail': str}
 
-    分支策略（2026-10 修正版，为真实数据实测后重排）：
+    分支策略：
 
       0) 本身就是明文媒体？            → 直接返回
       1) Old XOR 嗅探（最高优先级）    → 命中即返回
          理由：Windows 微信 4.x 落盘的主流格式就是单字节 XOR，
          且其首字节随机，极易伪造出 V1 的 07 08 magic。
-         必须让 XOR 先跑，绝不让"长得像 magic"的文件抢先进 AES。
+         让 XOR 先跑，避免「长得像 magic」的文件抢先进 AES。
       2) 严格判据通过才进 V1/V2       → _looks_like_aes_v1v2()
       3) 兜底：老式 .tmp 半加密（marker 0x1D/0x2A/0x3C + 3 字节校验）
     """
@@ -524,8 +480,6 @@ def decode_dat(blob: bytes, aes_key: bytes | None = None) -> dict:
                       detail="未加密（明文）")
         return result
 
-    # --- 1) Old XOR 嗅探（必须早于 AES 分支）---
-    #      ⚠️ 必须用 strong_validate 复核：detect_xor_key 对微信
     #      4.x 的 07 08 开头 .dat 恒返回假阳性（key=0x45/.bmp）。
     k = detect_xor_key(blob[:16])
     if k:
@@ -585,7 +539,6 @@ def decode_dat(blob: bytes, aes_key: bytes | None = None) -> dict:
     result["detail"] = "无法识别：非已知的 .dat 格式，也不是明文媒体"
     return result
 
-
 def _decode_tmp(blob: bytes) -> tuple[bytes, str] | None:
     """
     老版微信 .tmp 半加密图片：第 3 字节为 marker（0x1D/0x2A/0x3C），
@@ -604,10 +557,7 @@ def _decode_tmp(blob: bytes) -> tuple[bytes, str] | None:
         return plain, ident[0]
     return None
 
-
-# ---------------------------------------------------------------------------
 # 批量处理
-# ---------------------------------------------------------------------------
 
 def out_path_for(src: Path, dst_root: Path, src_root: Path, ext: str) -> Path:
     """保持相对目录结构，替换扩展名。"""
@@ -615,12 +565,11 @@ def out_path_for(src: Path, dst_root: Path, src_root: Path, ext: str) -> Path:
     rel = rel.with_suffix(ext)
     return dst_root / rel
 
-
 def is_metadata_dat(path_or_name) -> bool:
     """
     判断是否为**元数据类** .dat（非媒体，不应送进图片解码器）。
 
-    2026-10 实测真实微信数据后新增。微信会把一批非媒体的状态文件
+    微信会把一批非媒体的状态文件
     也命名成 .dat，它们与图片/视频 .dat 混在同一棵树里：
 
         alt_name.dat        会话别名表
@@ -638,7 +587,6 @@ def is_metadata_dat(path_or_name) -> bool:
         return True
     stem = name[:-4] if name.endswith(".dat") else name
     return stem in _META_DAT_STEMS
-
 
 def decode_dir(src_dir: Path, dst_dir: Path, aes_key: bytes | None = None,
                verbose: bool = True) -> dict:
@@ -695,10 +643,7 @@ def decode_dir(src_dir: Path, dst_dir: Path, aes_key: bytes | None = None,
     return {"ok": stat["ok"], "skip": stat["skip"], "error": stat["error"],
             "formats": dict(formats)}
 
-
-# ---------------------------------------------------------------------------
 # V2 密钥提取（Windows，读微信进程内存）
-# ---------------------------------------------------------------------------
 
 def extract_v2_key(pid: int | None = None) -> bytes | None:
     """
@@ -803,10 +748,7 @@ def extract_v2_key(pid: int | None = None) -> bytes | None:
     print("请把微信图片目录中的一个 .dat 路径作为 --probe 传入以自动验证。")
     return None
 
-
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="微信 .dat 附件解码器")
@@ -865,7 +807,6 @@ def main():
     elif args.cmd == "selftest":
         sys.exit(0 if _selftest() else 1)
 
-
 def _selftest() -> bool:
     """自测：构造三种格式的加密样本，验证解码器。"""
     import tempfile
@@ -916,7 +857,6 @@ def _selftest() -> bool:
     ]
     print(f"\n自测结果：{sum(tests)}/{len(tests)} 通过")
     return all(tests)
-
 
 if __name__ == "__main__":
     main()

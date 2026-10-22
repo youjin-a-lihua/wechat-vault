@@ -17,7 +17,6 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# ⚠ 关键：清掉系统代理。否则对 127.0.0.1 的请求会被代理拦截，
 #   表现为莫名其妙的 500/502，极易误判成服务端 bug。
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
            "ALL_PROXY", "all_proxy"):
@@ -35,13 +34,11 @@ import wv_auth as A  # noqa: E402
 
 ok = True
 
-
 def check(label, cond, detail=""):
     global ok
     if not cond:
         ok = False
     print(f"[{'PASS' if cond else 'FAIL'}] {label} {detail}")
-
 
 print("=" * 62)
 print("A. 认证模块单元测试")
@@ -100,14 +97,12 @@ srv_env.update({
     "WV_ALLOW_CIDRS": "127.0.0.0/8",
 })
 
-
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     p = s.getsockname()[1]
     s.close()
     return p
-
 
 PORT = free_port()
 BASE = f"http://127.0.0.1:{PORT}"
@@ -124,16 +119,13 @@ proc = subprocess.Popen(
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     encoding="utf-8", errors="replace")
 
-
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """禁止自动跟随 302，便于断言跳转目标。"""
     def redirect_request(self, *a, **k):
         return None
 
-
 _OP_FOLLOW = urllib.request.build_opener(_NO_PROXY)
 _OP_NOFOLLOW = urllib.request.build_opener(_NO_PROXY, NoRedirect())
-
 
 def req(path, method="GET", data=None, cookie=None, follow=True, raw=False):
     """返回 (status, body, headers)。headers 保留原始头（可读 Set-Cookie）。"""
@@ -153,7 +145,6 @@ def req(path, method="GET", data=None, cookie=None, follow=True, raw=False):
     except urllib.error.HTTPError as e:
         b = e.read()
         return (e.code, (b if raw else b.decode("utf-8", "replace")), e.headers)
-
 
 try:
     for _ in range(50):
@@ -177,7 +168,6 @@ try:
     st, body, _ = req("/login")
     check("登录页匿名可访问", st == 200 and "微信数据方舟" in body, f"{st}")
 
-    # 3b. 健康检查：必须匿名可达（Docker healthcheck 依赖，且源 IP 是容器网段）
     st, body, _ = req("/healthz")
     check("健康检查匿名可达", st == 200 and "ok" in body, f"{st} {body[:40]}")
 

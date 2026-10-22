@@ -4,7 +4,7 @@
 微信数据方舟 · WxAM(wxgf) 原图解码
 ===================================
 
-背景（2026-10-02 实测定稿；与两份开源实现交叉验证一致）
+背景
 -------------------------------------------------------
 微信 4.x 把「原图 / 高清图」压成私有容器格式 `wxgf`（微信内部称 WxAM）。
 V2 解密后以 `77 78 67 66`（`wxgf`）开头。
@@ -19,7 +19,7 @@ V2 解密后以 `77 78 67 66`（`wxgf`）开头。
   · ppwwyyxx/wechat-dump → `wechat/wxgf.py::extract_hevc_bitstream_from_wxgf()`
   · sjzar/chatlog        → `pkg/util/dat2img/wxgf.go`
 
-⚠️ 最大的坑（本机实测踩到并解决）
+主要难点
 --------------------------------
 **必须显式给 `-f hevc` 声明输入格式。** 若让 ffmpeg 自行探测（`-i pipe:0`），
 有相当比例的文件会直接报
@@ -30,7 +30,7 @@ V2 解密后以 `77 78 67 66`（`wxgf`）开头。
  用 `-f hevc` 后 ffmpeg 报 `hevc (Main Still Picture)`、`frame=1`，
  即**全部是单帧静态图**。）
 
-实测（本机 15,436 个 wxgf / 1.13 GB）
+15,436 个 wxgf / 1.13 GB
 ------------------------------------
   · 全部为单帧 HEVC 静态图；分辨率即原始尺寸（1280×1706 / 2844×1280 / 1280×1498 …）
   · 产物为全分辨率无瑕疵 JPEG；`-q:v 3` 体积与腾讯 DLL 重编码相当或更小
@@ -60,14 +60,11 @@ log = logging.getLogger(__name__)
 WXGF_MAGIC = b"wxgf"
 FIXED_BLOCK = bytes.fromhex("4b34278883a017cadb25201c644dafad")
 V2_MAGIC = b"\x07\x08V2\x08\x07"
-WXGF_HDR_LEN = 12                       # 实测 wxgf 头部固定 12 字节
+WXGF_HDR_LEN = 12
 FFMPEG = os.environ.get("WV_FFMPEG", "ffmpeg")
 TIMEOUT = int(os.environ.get("WV_FFMPEG_TIMEOUT", "90"))
 
-
-# ---------------------------------------------------------------------------
 # ffmpeg
-# ---------------------------------------------------------------------------
 
 def _ff(args: list[str], stdin: bytes, timeout: int = TIMEOUT):
     try:
@@ -78,7 +75,6 @@ def _ff(args: list[str], stdin: bytes, timeout: int = TIMEOUT):
         return -9, b"", "timeout"
     except FileNotFoundError:
         return -1, b"", "ffmpeg not found（镜像需安装 ffmpeg）"
-
 
 def _is_image(b: bytes) -> str | None:
     if len(b) < 64:
@@ -91,21 +87,17 @@ def _is_image(b: bytes) -> str | None:
         return "gif"
     return None
 
-
 def _try(payload: bytes, args: list[str]) -> bytes | None:
     rc, out, _ = _ff(args, payload)
     return out if rc == 0 and _is_image(out) else None
 
-
-# ---------------------------------------------------------------------------
 # 解码
-# ---------------------------------------------------------------------------
 
 def decode_wxgf(data: bytes) -> dict:
     """解码一个 wxgf → JPEG。返回 {'ok','fmt','data','detail'}。
 
     多级回退（跨微信版本/色彩空间的鲁棒性）：
-      ① `-f hevc` 显式声明（本机实测 100%）
+      ① `-f hevc` 显式声明（100%）
       ② 跳过 12 字节 wxgf 头后再 `-f hevc`
       ③ 让 ffmpeg 自行探测（兼容未来格式微调）
       ④/⑤ 保底改用 PNG 编码器（个别色彩空间 mjpeg 不接受）
@@ -138,14 +130,10 @@ def decode_wxgf(data: bytes) -> dict:
     out["detail"] = "解码失败 rc=%s %s" % (rc, err[:120])
     return out
 
-
-# ---------------------------------------------------------------------------
 # V2 解密
-# ---------------------------------------------------------------------------
 
 def xor_table(k: int) -> bytes:
     return bytes.maketrans(bytes(range(256)), bytes(b ^ k for b in range(256)))
-
 
 def v2_strip(blob: bytes, aes_key: bytes, xor_key: int) -> bytes | None:
     """去掉 V2 外壳，返回内层明文（可能是 wxgf / JPEG / PNG …）。"""
@@ -165,15 +153,11 @@ def v2_strip(blob: bytes, aes_key: bytes, xor_key: int) -> bytes | None:
     tail = blob[15 + aes_size + 16:15 + aes_size + 16 + xor_size].translate(xor_table(xor_key))
     return head + tail
 
-
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def _load_keys(out_dir: str) -> tuple[bytes, int]:
     k = json.load(open(os.path.join(out_dir, "_keys.json")))
     return k["aes_key"].encode(), int(k["xor_key"])
-
 
 def _dims(jpeg: bytes) -> str:
     """用 ffprobe 读尺寸（仅用于打印）。"""
@@ -185,7 +169,6 @@ def _dims(jpeg: bytes) -> str:
         return r.stdout.decode().strip().replace(",", "x")
     except Exception:
         return ""
-
 
 def cmd_probe(a):
     aes_key, xor_key = _load_keys(a.out)
@@ -216,14 +199,12 @@ def cmd_probe(a):
             shown += 1
     print("\n统计：", dict(stat))
 
-
 def cmd_decode(a):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import wv_media as M
     root = a.account_root or os.path.dirname(os.path.dirname(a.attach.rstrip("/")))
     print(json.dumps(M.run_wxam(root, a.vault, a.out, a.workers),
                      ensure_ascii=False, indent=2))
-
 
 def main():
     ap = argparse.ArgumentParser(description="WxAM(wxgf) 原图解码（ffmpeg / HEVC）")
@@ -237,7 +218,6 @@ def main():
     ap.add_argument("--show", type=int, default=12)
     a = ap.parse_args()
     (cmd_probe if a.cmd == "probe" else cmd_decode)(a)
-
 
 if __name__ == "__main__":
     main()

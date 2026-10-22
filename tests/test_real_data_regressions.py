@@ -42,7 +42,6 @@ import wv_dat as D  # noqa: E402
 PASS = 0
 FAIL = 0
 
-
 def check(cond: bool, name: str, detail: str = "") -> None:
     global PASS, FAIL
     if cond:
@@ -51,7 +50,6 @@ def check(cond: bool, name: str, detail: str = "") -> None:
     else:
         FAIL += 1
         print(f"  [FAIL] {name} {detail}")
-
 
 def main() -> int:
     print("=" * 66)
@@ -151,7 +149,6 @@ def main() -> int:
         p.write_text(content, encoding="utf-8")
         check(not A.looks_like_chat_export(p), f"拒绝垃圾 «{fn}»")
 
-    # 真聊天导出：必须全部收
     good = {
         "chat.txt": "张三\n" + "\n".join(
             f"2026-09-0{i} 10:0{i}:00 张三\n消息内容 第{i}条" for i in range(1, 6)),
@@ -179,7 +176,6 @@ def main() -> int:
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 66)
     return 1 if FAIL else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

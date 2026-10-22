@@ -56,16 +56,13 @@ DAT_LIMIT = 120         # 每边最多复制多少个 .dat
 SIZE_BUDGET = 300 * 1024 * 1024   # 每边复制总量上限 300MB
 IMG_DIRS = 4            # 取月份最新的 N 个 Img 目录
 
-
 def log(msg: str) -> None:
     print(msg, flush=True)
-
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     """执行子进程，统一按 UTF-8 解码。"""
     return subprocess.run(cmd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", **kw)
-
 
 def stage_slice(tag: str, src: Path) -> dict:
     """把源目录的代表性切片复制进沙箱。源目录只读打开。"""
@@ -141,7 +138,6 @@ def stage_slice(tag: str, src: Path) -> dict:
     info["backup_copied"] = n_bak
 
     # ---- b) 可读轨①：msg/attach/<hash>/<YYYY-MM>/Img/*.dat ----
-    # 实测路径形如 wxid_xxx/msg/attach/<32hex>/<YYYY-MM>/Img/
     # 判据：目录名是 Img，且其父目录名形如 YYYY-MM。
     img_dirs: list[Path] = []
     for dirpath, _dirnames, _filenames in os.walk(src):
@@ -209,7 +205,6 @@ def stage_slice(tag: str, src: Path) -> dict:
 
     return info
 
-
 def arch_scan(source: Path, tag: str) -> dict:
     store = SANDBOX / f"store_{tag}"
     r = run([PY, str(ARCH), "scan", "--source", str(source),
@@ -217,11 +212,9 @@ def arch_scan(source: Path, tag: str) -> dict:
     out = (r.stdout or "") + (r.stderr or "")
     return {"rc": r.returncode, "out": out[-2500:], "store": str(store)}
 
-
 def arch_stats(store: Path) -> dict:
     r = run([PY, str(ARCH), "stats", "--store", str(store)])
     return {"rc": r.returncode, "out": (r.stdout or "")[-2500:]}
-
 
 def dat_decode(src: Path, dst: Path) -> dict:
     if not any(src.rglob("*.dat")):
@@ -229,7 +222,6 @@ def dat_decode(src: Path, dst: Path) -> dict:
     r = run([PY, str(DAT), "decode", "--src", str(src), "--dst", str(dst)])
     out = (r.stdout or "") + (r.stderr or "")
     return {"rc": r.returncode, "out": out[-2500:]}
-
 
 def main() -> int:
     SANDBOX.mkdir(parents=True, exist_ok=True)
@@ -302,7 +294,6 @@ def main() -> int:
                     encoding="utf-8")
     log(f"\n报告：{outp}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

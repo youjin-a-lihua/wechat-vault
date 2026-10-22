@@ -7,7 +7,7 @@ wv_woc.py —— 微信数据源适配器（阶段二核心，单容器一体化
 对接 wv_archiver 入库到 vault.db（可全文搜索）。
 
 ════════════════════════════════════════════════════════════════════
-  技术事实（已核实，2026-10-02 调研定论，禁止臆想）
+  技术事实
 ════════════════════════════════════════════════════════════════════
 1. 数据落盘位置（Linux 版微信，微信 4.x）：
        ~/.xwechat/xwechat_files/<账号wxid>/db_storage/
@@ -62,8 +62,6 @@ from pathlib import Path
 # ──────────────────────────────────────────────────────────────────
 # 常量：可被环境变量覆盖（与容器部署对齐）
 # ──────────────────────────────────────────────────────────────────
-# 微信数据根【2026-10-02 实测确认】：/config/xwechat_files/（abc HOME=/config）
-#   ⚠️ 实测与预研有出入：不是 ~/.xwechat/xwechat_files，而是 HOME 下直接 xwechat_files
 #   账号目录 = wxid_xxx_<后缀>，其下 db_storage/message/message_0.db 等
 WX_DATA_ROOT = Path(os.environ.get("WV_WX_DATA_ROOT", "/config/xwechat_files"))
 # 微信二进制
@@ -71,14 +69,13 @@ WX_BIN = os.environ.get("WV_WX_BIN", "/data/wechat/opt/wechat/wechat")
 # wxchat-export CLI（若安装）
 WXCE = os.environ.get("WV_WXCE_BIN", "wxchat-export")
 
-
 # ──────────────────────────────────────────────────────────────────
 # 1) 账号发现
 # ──────────────────────────────────────────────────────────────────
 def discover_accounts(root: Path | None = None) -> list[str]:
     """扫描数据根，列出账号目录（wxid_*）。
 
-    TODO(C 阶段·实测)：确认容器内 db_storage 的实际目录层级后，
+    TODO(C 阶段)：确认容器内 db_storage 的实际目录层级后，
     这里改为精确匹配 <root>/<wxid>/db_storage/ 或 <root>/<wxid>。
     当前只做宽松探测，不臆想精确结构。
     """
@@ -91,7 +88,6 @@ def discover_accounts(root: Path | None = None) -> list[str]:
             accounts.append(p.name)
     return accounts
 
-
 # ──────────────────────────────────────────────────────────────────
 # 2) 触发导出（复用 wxchat-export）
 # ──────────────────────────────────────────────────────────────────
@@ -99,12 +95,11 @@ def run_wxce(*args: str) -> subprocess.CompletedProcess:
     """调 wxchat-export CLI（账号发现/抓 key/导出）。"""
     return subprocess.run([WXCE, *args], capture_output=True, text=True)
 
-
 def export_account(account: str, out_dir: Path, db_key: str | None = None) -> Path:
     """导出单个账号全部会话为 JSONL。
 
     返回导出目录（含 manifest.json + sessions/*.jsonl）。
-    TODO(C 阶段·实测)：确认 wxchat-export 的 JSONL 字段结构后，
+    TODO(C 阶段)：确认 wxchat-export 的 JSONL 字段结构后，
     完善 to_archive_format() 的字段映射。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -117,14 +112,13 @@ def export_account(account: str, out_dir: Path, db_key: str | None = None) -> Pa
         raise RuntimeError(f"wxchat-export 导出失败: {r.stderr.strip()[:500]}")
     return out_dir
 
-
 # ──────────────────────────────────────────────────────────────────
 # 3) JSONL → 方舟标准化消息
 # ──────────────────────────────────────────────────────────────────
 def to_archive_format(jsonl_dir: Path, account: str) -> list[dict]:
     """把 wxchat-export 的 sessions/*.jsonl 转成 wv_parser 标准消息 dict。
 
-    TODO(C 阶段·实测)：字段映射需按实测 JSONL 结构校准。
+    TODO(C 阶段)：字段映射需按 JSONL 结构校准。
     预期 wxchat-export 每行含：发送者/时间/正文/是否群聊/会话名。
     """
     msgs: list[dict] = []
@@ -137,7 +131,6 @@ def to_archive_format(jsonl_dir: Path, account: str) -> list[dict]:
                 if not line:
                     continue
                 rec = json.loads(line)
-                # TODO(C)：据实测映射 rec → {ts,time_str,sender,content,is_self,is_group}
                 msgs.append({
                     "conv_title": conv_title,
                     "ts": rec.get("ts"),
@@ -150,7 +143,6 @@ def to_archive_format(jsonl_dir: Path, account: str) -> list[dict]:
                 })
     return msgs
 
-
 # ──────────────────────────────────────────────────────────────────
 # 4) 主流程编排
 # ──────────────────────────────────────────────────────────────────
@@ -158,7 +150,7 @@ def ingest(source_root: Path | None = None, out_dir: Path | None = None,
            db_key: str | None = None) -> int:
     """一条龙：发现账号 → 导出 JSONL → 转标准消息 → （后续）喂归档器。
 
-    TODO(C 阶段·实测)：最后一步「标准消息 → vault.db」尚未接，
+    TODO(C 阶段)：最后一步「标准消息 → vault.db」尚未接，
     待确认 wxchat-export JSONL 结构与 wv_archiver 入库接口后补全。
     """
     accounts = discover_accounts(source_root)
@@ -174,7 +166,6 @@ def ingest(source_root: Path | None = None, out_dir: Path | None = None,
         print(f"[wv_woc]   {acc}: {len(msgs)} 条消息")
     print("[wv_woc] 导出完成。下一步（C 阶段实测后）：接入 wv_archiver 入库。")
     return 0
-
 
 # ──────────────────────────────────────────────────────────────────
 # CLI
@@ -202,7 +193,6 @@ def main() -> int:
                       args.db_key)
     ap.print_help()
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
