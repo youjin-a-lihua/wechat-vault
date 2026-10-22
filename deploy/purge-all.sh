@@ -5,12 +5,12 @@
 #  用途：把收件箱 / 热库 / 存档轨 / 冷备 / 日志全部清空，回到全新状态。
 #        用于清除测试数据、或要彻底重新归档。
 #
-#  用法：sudo sh /data/wechat-vault/deploy/purge-all.sh
+#  用法：sudo sh <WV_DATA_DIR>/deploy/purge-all.sh
 #        加 --yes 跳过交互确认（供脚本调用）
 # ============================================================
 set -e
-ROOT=/data/wechat-vault
-COLD=/data-cold-host/wechat-vault-cold
+ROOT="${WV_DATA_DIR:?请设置 WV_DATA_DIR}"
+COLD="${WV_COLD_DIR:-/data-cold-host}"
 
 if [ "$1" != "--yes" ]; then
     echo "=========================================="

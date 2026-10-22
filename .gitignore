@@ -98,3 +98,8 @@ desktop.ini
 
 # 二进制打包产物（vendor 已有源码，勿重复提交）
 deploy/vendor/wxextract.tar.gz
+
+# 作者私有部署脚本（含真实 NAS 路径，不适合公开）
+tests/_nas_*.py
+tests/_clean_demo.sh
+tests/compat_real_report.json

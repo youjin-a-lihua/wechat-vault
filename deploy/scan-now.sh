@@ -2,13 +2,13 @@
 # ============================================================
 #  WeChat Vault · 手动归档（在 NAS 宿主机上执行）
 #  用途：不想等到 03:00，想立刻把收件箱里的新导出归档 + 冷备
-#  用法：sudo sh /data/wechat-vault/deploy/scan-now.sh
+#  用法：sudo sh <WV_DATA_DIR>/deploy/scan-now.sh
 #
 #  NAS 上的 deploy/ 目录里如果已有旧版脚本，请用本文件覆盖。
 # ============================================================
 set -e
-ROOT=/data/wechat-vault
-COLD=/data-cold-host/wechat-vault-cold
+ROOT="${WV_DATA_DIR:?请设置 WV_DATA_DIR}"
+COLD="${WV_COLD_DIR:-/data-cold-host}"
 
 # 以 AKI(1000:1001) 身份在容器内跑，保证文件属主一致
 echo "== 1/4 可读轨归档（inbox → vault.db）=="

@@ -1058,9 +1058,9 @@ async function openArchive() {
     <div class="arch-note">
       <div><code>inbox/&lt;微信号&gt;/</code> — 可读轨：微信官方导出的 TXT / HTML / CSV / JSON</div>
       <div><code>inbox/raw/</code> — 存档轨：手机备份包（Backup.db、BAK_0_TEXT、BAK_0_MEDIA…）</div>
-      <div>放进目录后点下方按钮，或等每天 03:00 自动归档</div>
+      <div>放进目录后点下方按钮；<b>5 分钟内也会自动解析</b>（只处理新增文件）</div>
     </div>
-    <button class="arch-btn" id="btnScanNow">立即归档</button>
+    <button class="arch-btn" id="btnScanNow">立即解析（含图片）</button>
     <span id="scanMsg" class="arch-scan-msg"></span>
   </div>`;
 
@@ -1074,11 +1074,11 @@ async function doScan() {
   const btn = $('#btnScanNow');
   const msg = $('#scanMsg');
   btn.disabled = true;
-  msg.textContent = '归档中…';
+  msg.textContent = '解析中…（含图片解密与关联，首次可能需几分钟）';
   try {
     const r = await fetch('/api/ingest', { method: 'POST' });
     const d = await r.json();
-    msg.textContent = d.ok ? '完成，正在重载…' : '归档失败';
+    msg.textContent = d.ok ? '完成，正在重载…' : '解析失败（可查看 /data/logs/scan.log）';
     setTimeout(() => { location.reload(); }, 1200);
   } catch (e) {
     msg.textContent = '失败：' + e.message;

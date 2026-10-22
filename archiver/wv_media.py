@@ -311,40 +311,119 @@ def _setup_logging() -> None:
         datefmt="%H:%M:%S",
     )
 
+_DECODE_CACHE = "_decode_cache.json"
+
+
+def _load_decode_cache(out: str) -> dict:
+    """读取 .dat 解密缓存：{相对路径: {mtime,size,plain_size,rel,md5}}。
+
+    读不到/损坏 → 返回 {}（退化为全量解密，不会出错）。
+    """
+    p = os.path.join(out, _DECODE_CACHE)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        files = d.get("files") if isinstance(d, dict) else None
+        return files if isinstance(files, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_decode_cache(out: str, files: dict) -> None:
+    """原子写解密缓存（tmp + rename），避免中断写出半个文件。"""
+    p = os.path.join(out, _DECODE_CACHE)
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"files": files}, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except OSError as e:
+        log.warning("解密缓存写入失败（下次会退化为全量解密）：%s", e)
+
+
 def run_decode(attach: str, out: str, aes_key: bytes, xor_key: int,
-               workers: int = 4) -> dict:
-    """批量解密全部 .dat，返回 (哈希, 月份, 明文长度) → 相对路径 的索引。"""
+               workers: int = 4, force: bool = False) -> dict:
+    """批量解密全部 .dat，返回 (哈希, 月份, 明文长度) → 相对路径 的索引。
+
+    增量优化：`<out>/_decode_cache.json` 记录每个 .dat 的 (mtime,size) 与解密结果。
+    未变更的文件**不读盘、不解密**，直接复用缓存里的索引信息。
+    首次仍会全量跑一遍；`force=True` 可忽略缓存强制全量。
+    """
     files = glob.glob(attach + "/*/*/Img/*.dat")
     os.makedirs(out, exist_ok=True)
-    print("  待解密 .dat：%d" % len(files))
     stats = collections.Counter()
     sizemap: dict[tuple, str] = {}
     md5map: dict[str, str] = {}
     t0 = time.time()
-    with Pool(workers, _init_worker, (aes_key, xor_key, out)) as pool:
-        for i, res in enumerate(pool.imap_unordered(_worker, files, chunksize=200), 1):
-            if not res:
-                stats["读取失败"] += 1
-                continue
-            path, size, rel, md5 = res
-            if size is None:
-                stats["解码失败"] += 1
-                continue
-            stats["解码成功"] += 1
-            if not rel:
-                stats["wxgf需二层解压"] += 1
-                continue
-            parts = os.path.relpath(path, attach).split(os.sep)
-            if len(parts) >= 2:
-                sizemap[(parts[0], parts[1], size)] = rel
-            md5map[md5] = rel
-            stats["已落盘"] += 1
-            if i % 20000 == 0:
-                print("    ... %d/%d" % (i, len(files)), flush=True)
+
+    cache = {} if force else _load_decode_cache(out)
+    todo: list[str] = []
+    meta: dict[str, tuple] = {}
+    stat_err = [0]
+    reused = 0
+
+    def consume(relp: str, plain_size, rel: str, md5: str) -> None:
+        """把一条解密结果计入统计 + 两张索引（缓存命中与现解共用）。"""
+        if plain_size is None:
+            stats["解码失败"] += 1
+            return
+        stats["解码成功"] += 1
+        if not rel:
+            stats["wxgf需二层解压"] += 1
+            return
+        parts = relp.split(os.sep)
+        if len(parts) >= 2:
+            sizemap[(parts[0], parts[1], plain_size)] = rel
+        md5map[md5] = rel
+        stats["已落盘"] += 1
+
+    for p in files:
+        relp = os.path.relpath(p, attach)
+        try:
+            st = os.stat(p)
+        except OSError as e:
+            stat_err[0] += 1
+            if stat_err[0] <= 5:
+                log.warning("stat 失败，跳过该 .dat：%s（%s）", p, e)
+            continue
+        ent = cache.get(relp)
+        if (ent and not force
+                and abs(float(ent.get("mtime", -1)) - st.st_mtime) < 1e-6
+                and ent.get("size") == st.st_size):
+            consume(relp, ent.get("plain_size"), ent.get("rel") or "", ent.get("md5") or "")
+            reused += 1
+        else:
+            meta[p] = (relp, st.st_mtime, st.st_size)
+            todo.append(p)
+
+    if stat_err[0]:
+        log.warning("共 %d 个 .dat 无法 stat（权限/并发删除），已跳过", stat_err[0])
+    print("  待解密 .dat：%d（缓存命中 %d，需处理 %d）"
+          % (len(files), reused, len(todo)))
+
+    new_cache = dict(cache)
+    if todo:
+        with Pool(workers, _init_worker, (aes_key, xor_key, out)) as pool:
+            for i, res in enumerate(pool.imap_unordered(_worker, todo, chunksize=200), 1):
+                if not res:
+                    stats["读取失败"] += 1
+                    continue
+                path, size, rel, md5 = res
+                relp, mt, sz = meta[path]
+                consume(relp, size, rel, md5)
+                new_cache[relp] = {"mtime": mt, "size": sz,
+                                   "plain_size": size, "rel": rel, "md5": md5}
+                if i % 20000 == 0:
+                    print("    ... %d/%d" % (i, len(todo)), flush=True)
+
     print("  完成 %.1fs：%s" % (time.time() - t0, dict(stats)))
     idx = {"sizemap": {"%s|%s|%d" % k: v for k, v in sizemap.items()},
            "md5map": md5map}
-    json.dump(idx, open(os.path.join(out, "_index.json"), "w"))
+    with open(os.path.join(out, "_index.json"), "w", encoding="utf-8") as f:
+        json.dump(idx, f)
+    # 只有真跑过才写缓存（全命中时无需重写，省一次 10MB 落盘）
+    if todo:
+        _save_decode_cache(out, new_cache)
     print("  索引：%d 条尺寸索引 / %d 条 md5 索引" % (len(sizemap), len(md5map)))
     return idx
 
@@ -371,6 +450,7 @@ def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
 
     sizes_map: dict[tuple, list[int]] = {}
     thumb_map: dict[tuple, list[int]] = {}
+    bad_zstd = [0]
     zbuf = zstd.ZstdDecompressor()
     img_re = re.compile(rb"<img ([^>]*)>")
     attr_re = re.compile(rb'([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"')
@@ -393,7 +473,11 @@ def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
                 for ct, mc in rows:
                     try:
                         txt = zbuf.decompress(mc)
-                    except Exception:
+                    except Exception as e:
+                        # 只记前 5 条，避免百萬级循环刷屏；总数最后统一报告
+                        bad_zstd[0] += 1
+                        if bad_zstd[0] <= 5:
+                            log.warning("zstd 解压失败（ts=%s）：%s", ct, e)
                         continue
                     m = img_re.search(txt)
                     if not m:
@@ -414,6 +498,8 @@ def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
             log.warning("消息表查询失败，该库尺寸信息缺失，会拉低后续关联命中率：%s", e)
             continue
 
+    if bad_zstd[0]:
+        log.warning("共 %d 条消息的 message_content 无法解压，已跳过", bad_zstd[0])
     _PLAIN_META_CACHE[plain_dbs] = (sizes_map, thumb_map)
     return sizes_map, thumb_map
 
@@ -592,6 +678,8 @@ def main():
     ap.add_argument("--account-root", dest="account_root", default="",
                     help="账号数据根（…/<wxid>_<设备后缀>，含 msg/）")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--force", action="store_true",
+                    help="忽略增量缓存，强制全量重跑（decode）")
     a = ap.parse_args()
 
     cache = os.path.join(a.out, "_keys.json")
@@ -609,7 +697,7 @@ def main():
     if a.cmd in ("decode", "all"):
         k = json.load(open(cache))
         idx = run_decode(a.attach, a.out, k["aes_key"].encode(), int(k["xor_key"]),
-                         a.workers)
+                         a.workers, force=a.force)
         info["decode"] = {"sizemap": len(idx["sizemap"]), "md5map": len(idx["md5map"])}
 
     if a.cmd in ("link", "all"):
@@ -632,7 +720,15 @@ def main():
     if a.cmd in ("emoji", "extras") and a.plain_dbs:
         info["emoji"] = run_emoji(a.plain_dbs, a.vault, a.out)
     if a.cmd in ("avatars-fetch", "extras") and a.plain_dbs:
-        info["avatars_fetch"] = run_avatars_fetch(a.plain_dbs, a.vault, a.out)
+        # ⚠ run_avatars_fetch 从未实现（历史遗留 CLI 入口），直接用会 NameError，
+        #   把整个 extras 打断（视频/文件/语音/原图都白跑）。
+        #   本地头像已由 `avatars` 从 head_image.db 落盘，该命令非必需。
+        _fn = globals().get("run_avatars_fetch")
+        if _fn:
+            info["avatars_fetch"] = _fn(a.plain_dbs, a.vault, a.out)
+        else:
+            log.warning("avatars-fetch 未实现，已跳过（本地头像请用 avatars 子命令）")
+            info["avatars_fetch"] = {"skipped": True}
 
     print("\n完成：", json.dumps(info, ensure_ascii=False, indent=2))
 
@@ -672,8 +768,11 @@ def run_videos(account_root: str, vault: str, out: str, plain_dbs: str = "") -> 
     os.makedirs(mdir, exist_ok=True)
     upd, playable, cover_only = [], 0, 0
     zb = zstd.ZstdDecompressor()
-    # 从明文库补 cdnthumblength：(hash, ct) → 缩略图长度
-    tlen = _video_thumb_len(_plain_root(out))
+    # 从明文库补 cdnthumblength：(hash, ct) → [缩略图长度…]
+    # ⚠ 原代码调用的是 _video_thumb_len()，而该函数**从未定义**（NameError），
+    #   所以 videos / extras 一跑就崩、视频与语音关联长期失效。
+    #   这里复用已实现的 _plain_thumb_len（同一份明文库扫描结果）。
+    tlen = _plain_thumb_len(_plain_root(out))
     for mid, sf, ts in rows:
         if not ts:
             continue
@@ -682,10 +781,15 @@ def run_videos(account_root: str, vault: str, out: str, plain_dbs: str = "") -> 
         if not h:
             continue
         mo = _month8(ts)
-        tl = tlen.get((h, ts))
-        if not tl:
+        tlens = tlen.get((h, ts)) or []
+        if not tlens:
             continue
-        src = thumbs.get((mo, tl))
+        # 同一秒可能有多条视频 → 逐个候选尺寸试，任一命中即可
+        src = None
+        for _tl in tlens:
+            src = thumbs.get((mo, _tl))
+            if src:
+                break
         if not src:
             continue
         stem = os.path.basename(src)[:-10]

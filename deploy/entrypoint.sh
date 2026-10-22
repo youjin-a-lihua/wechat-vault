@@ -26,7 +26,7 @@ if [ -w /app ]; then
     chmod +x /app/entrypoint.sh 2>/dev/null || true
 fi
 
-ROOT="${WV_ROOT:-/data}"                       # 热侧根（对应 /data/wechat-vault）
+ROOT="${WV_ROOT:-/data}"                       # 热侧根（对应 <WV_DATA_DIR>）
 STORE="${WV_STORE:-$ROOT}"                     # 归档库 == 热侧根
 INBOX="${WV_INBOX:-$ROOT/inbox}"               # 投放口
 RAW_INBOX="${WV_RAW_INBOX:-$INBOX/raw}"        # 存档轨投放口

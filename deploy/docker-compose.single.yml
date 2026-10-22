@@ -68,15 +68,15 @@ services:
       # ── 访问控制（与旧部署同一套密码体系）──
       - WV_PASSWORD_HASH=${WV_PASSWORD_HASH:-}
       - WV_SECRET=${WV_SECRET:-}
-      - WV_ALLOW_CIDRS=${WV_ALLOW_CIDRS:-192.168.31.0/24,192.168.100.0/24,127.0.0.1/32}
+      - WV_ALLOW_CIDRS=${WV_ALLOW_CIDRS:-127.0.0.1/32}
 
     volumes:
       # 热数据（vol3 SSD）
-      - /data/wechat-vault-single:/data
+      - ${WV_DATA_DIR:?请先在 deploy/.env 设置 WV_DATA_DIR（热数据目录）}:/data
       # 冷备（HC620）
-      - /data-cold-host/wechat-vault-cold:/data-cold
+      - ${WV_COLD_DIR:-/data-cold-host}:/data-cold
       # 微信会话 HOME（登录态/聊天库/字体配置）——容器重建不丢登录
-      - /data/wechat-vault-single/wechat-home:/config
+      - ${WV_CONFIG_DIR:-${WV_DATA_DIR}/wechat-home}:/config
 
     # 微信内嵌 CEF 需要较大共享内存，否则可能白屏/崩溃
     shm_size: "1gb"

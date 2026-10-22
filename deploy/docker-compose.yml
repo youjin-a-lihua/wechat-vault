@@ -25,9 +25,9 @@ services:
       #     raw-snapshots/  存档轨原始包（.bak / xwechat_files 全量），按日期分代
       #     vault.db     归档主库
       #     MANIFEST.json 完整性指纹清单
-      - /data/wechat-vault:/data
+      - ${WV_DATA_DIR:?请先在 deploy/.env 设置 WV_DATA_DIR（热数据目录）}:/data
       # 冷备（HC620 外接 HDD）：vol3 是它的理论缓存 → 整目录同构镜像
-      - /data-cold-host/wechat-vault-cold:/data-cold
+      - ${WV_COLD_DIR:-/data-cold-host}:/data-cold
     environment:
       - TZ=Asia/Shanghai
       # ── 热侧路径（全部落在 /data 之下）──
@@ -50,8 +50,8 @@ services:
       - WV_PASSWORD_HASH=${WV_PASSWORD_HASH:-}
       - WV_SECRET=${WV_SECRET:-}
       #   只允许这些网段访问（逗号分隔；留空 = 不限制网段，仅靠密码）
-      #   例：WV_ALLOW_CIDRS=192.168.31.0/24,192.168.100.0/24
-      - WV_ALLOW_CIDRS=${WV_ALLOW_CIDRS:-192.168.31.0/24,192.168.100.0/24,127.0.0.1/32}
+      #   例：WV_ALLOW_CIDRS=192.168.1.0/24,10.0.0.0/8
+      - WV_ALLOW_CIDRS=${WV_ALLOW_CIDRS:-127.0.0.1/32}
     healthcheck:
       # ⚠ 必须打 /healthz，不能打 /api/status。
       #   开启访问密码后 /api/status 未登录会返回 401，urlopen 抛 HTTPError，

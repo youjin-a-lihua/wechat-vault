@@ -779,6 +779,53 @@ def api_ingest():
         except subprocess.TimeoutExpired:
             results["raw"] = {"ok": False, "error": "存档轨归档超时（>900s）"}
 
+    # ③ 媒体链路：新图解密 / 消息关联 / WxAM 原图 / 视频·语音·文件
+    #    ⚠ 只跑 scan 的话，文字有了但图片仍关联不上（界面空白）。
+    #    ⚠ wv_media 依赖 pycryptodome + zstandard —— 只有 wx-venv 有；
+    #      viewer 跑在 wv-venv 上，所以必须换解释器（WV_MEDIA_PYTHON 可覆盖）。
+    media_py = here / "wv_media.py"
+    if media_py.is_file():
+        py_media = os.environ.get("WV_MEDIA_PYTHON", "/opt/wx-venv/bin/python3")
+        plain_dbs = Path(os.environ.get("WV_PLAIN_DBS", "/data/wx_backup/plain_dbs"))
+        wx_files = Path(os.environ.get("WV_WECHAT_FILES", "/config/xwechat_files"))
+        media_out = Path(os.environ.get("WV_MEDIA", str(store / "media")))
+        if not os.path.exists(py_media):
+            results["media"] = {"ok": False, "error": "媒体解释器缺失: %s" % py_media}
+        elif not plain_dbs.is_dir():
+            results["media"] = {"ok": False,
+                                "error": "解密明文库不存在: %s" % plain_dbs}
+        else:
+            accs = []
+            for acct in sorted(wx_files.glob("*/")):
+                attach = acct / "msg" / "attach"
+                if not attach.is_dir():
+                    continue
+                seg = {"account": acct.name, "ok": True, "steps": []}
+                for cmd in ("all", "extras"):
+                    try:
+                        p = subprocess.run(
+                            [py_media, str(media_py), cmd,
+                             "--attach", str(attach),
+                             "--account-root", str(acct),
+                             "--vault", str(store / "vault.db"),
+                             "--plain-dbs", str(plain_dbs),
+                             "--out", str(media_out)],
+                            capture_output=True, text=True, timeout=1800)
+                        seg["steps"].append({
+                            "cmd": cmd, "returncode": p.returncode,
+                            "tail": (p.stdout or "").strip().splitlines()[-4:],
+                        })
+                        if p.returncode != 0:
+                            seg["ok"] = False
+                    except subprocess.TimeoutExpired:
+                        seg["steps"].append({"cmd": cmd, "error": "超时（>1800s）"})
+                        seg["ok"] = False
+                accs.append(seg)
+            results["media"] = {
+                "ok": all(a["ok"] for a in accs) if accs else True,
+                "accounts": accs,
+            }
+
     # 归档完立即重载，让页面拿到新数据
     res = load_store(store) if STATE.get("mode") == "store" else load_data(store)
     _invalidate_derived_caches()
