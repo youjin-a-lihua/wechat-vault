@@ -49,8 +49,29 @@ cd deploy
 sudo docker compose -f docker-compose.single.yml up -d
 ```
 
-打开 `http://<NAS_IP>:8790`。一个容器 = 一台「微信备份接收机」：
-内嵌官方微信 Linux 客户端 + KasmVNC 网页桌面，手机走官方「聊天记录迁移与备份」通道投递数据。
+打开 `http://<NAS_IP>:8790`。容器内嵌官方微信 Linux 客户端 + KasmVNC 网页桌面，
+扫码登录后即可把客户端里的聊天记录同步进方舟。
+
+### 从微信客户端同步
+
+微信登录后，聊天记录存在本地加密数据库（SQLCipher 4）里，一步同步：
+
+```bash
+docker exec wechat-vault /opt/wx-venv/bin/python3 /app/archiver/wv_sync.py story \
+    --wechat-files /config/xwechat_files \
+    --keys /data/wx_backup/all_keys.json \
+    --vault /data/vault.db \
+    --plain-out /data/wx_backup/plain_dbs
+```
+
+`story` 做三件事：解密数据库 → 读消息写入 vault.db → 供查看器展示。
+之后跑一次媒体链路把图片、视频、语音接上（见下文「核心能力」）。
+
+密钥说明：
+
+- `all_keys.json` 存的是每个库的 `enc_key` 快照，库被微信重建后这份快照会失效
+- `passphrase.json`（与 `all_keys.json` 同目录）存账号级 password，可据此为任意库重新派生密钥，长期有效
+- `wv_sync.py` 会优先用 `passphrase.json`，没有时才回退到 `all_keys.json`
 
 > 详情见下文「部署」与 `docs/计划书.md`。
 
@@ -120,8 +141,11 @@ sudo docker compose -f docker-compose.single.yml up -d
 1. 打开 `http://<NAS_IP>:8790`（面板）
 2. 「微信运行时」卡片显示下载/安装进度
 3. 装好后打开微信桌面（KasmVNC，默认映射到 13000），扫码登录
-4. 手机微信 → 聊天记录迁移与备份 → 备份到电脑 → 选这台"电脑"
-5. 数据落盘后进入阶段二（导出 → 归档 → 关联 → 解码）
+4. 登录后执行上文「从微信客户端同步」的 `wv_sync.py story`
+5. 再跑媒体链路（`wv_media.py`）把图片、视频、语音接上
+
+> 也可以走「手机微信 → 聊天记录迁移与备份 → 备份到电脑」把历史记录迁进客户端，
+> 之后再执行 `wv_sync.py story` 同步。两条路最终都汇入 vault.db。
 
 ### 红线
 
