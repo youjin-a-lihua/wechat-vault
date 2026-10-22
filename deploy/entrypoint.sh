@@ -86,6 +86,8 @@ cat > /app/scheduler.sh <<'SCHED'
 STORE="$WV_STORE"; INBOX="$WV_INBOX"; LOGS="$WV_LOGS"
 RAW_INBOX="$WV_RAW_INBOX"; RAW_SNAPS="$WV_RAW_SNAPSHOTS"; ARCHIVE_RAW="$WV_ARCHIVE_RAW"
 COLD="$WV_COLD"; SCAN_HOUR="$WV_SCAN_HOUR"; SYNC_COLD="$WV_SYNC_COLD"
+MEDIA="${WV_MEDIA:-/data/media}"; PLAIN_DBS="${WV_PLAIN_DBS:-/data/wx_backup/plain_dbs}"
+MEDIA_AUTO="${WV_MEDIA_AUTO:-1}"; WX_FILES="${WV_WECHAT_FILES:-/config/xwechat_files}"
 while true; do
     NOW_H=$(date +%H); NOW_M=$(date +%M)
     # 到点（HH:00~HH:04 之间）执行一次；LAST_DAY 防重复
@@ -101,6 +103,29 @@ while true; do
             python /app/archiver/wv_raw.py ingest \
                 --source "$RAW_INBOX" --dest "$RAW_SNAPS" --manifest "$STORE/MANIFEST.json" \
                 >> "$LOGS/scan.log" 2>&1 || true
+        fi
+        # ③ 媒体链路（新图解密 / 消息关联 / WxAM 原图 / 视频语音文件）
+        #    ⚠ 这一步原先缺失：只跑 scan 的话，新聊天记录的文字能看到，
+        #    但新图片、语音、视频全都关联不上（界面上是空的）。
+        #    前提：解密明文库 PLAIN_DBS 已存在（由 wxchat-export 导出过一次）。
+        #    用 WV_MEDIA_AUTO=0 可关闭。
+        if [ "$MEDIA_AUTO" = "1" ] && [ -d "$PLAIN_DBS" ] && [ -d "$WX_FILES" ]; then
+            for acct in "$WX_FILES"/*/; do
+                [ -d "${acct}msg/attach" ] || continue
+                echo "[$(date '+%F %T')] 媒体链路: $acct" >> "$LOGS/scan.log"
+                python /app/archiver/wv_media.py all \
+                    --attach "${acct}msg/attach" \
+                    --account-root "${acct%/}" \
+                    --vault "$STORE/vault.db" \
+                    --plain-dbs "$PLAIN_DBS" \
+                    --out "$MEDIA" >> "$LOGS/scan.log" 2>&1 || true
+                python /app/archiver/wv_media.py extras \
+                    --attach "${acct}msg/attach" \
+                    --account-root "${acct%/}" \
+                    --vault "$STORE/vault.db" \
+                    --plain-dbs "$PLAIN_DBS" \
+                    --out "$MEDIA" >> "$LOGS/scan.log" 2>&1 || true
+            done
         fi
         # 通知查看器重载（archiver 直连 SQLite，查看器需重读）
         python -c "

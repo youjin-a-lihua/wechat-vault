@@ -86,6 +86,69 @@ start_vault() {
 log "方舟服务看守已启动"
 
 # ---------------------------------------------------------------------------
+# 3.5) 定时归档调度器（每天 WV_SCAN_HOUR 点）
+#      ⚠ 原先这段只写在 entrypoint.sh 里，而 entrypoint.sh 是孤儿文件
+#        （容器 ENTRY=/init，没人调用它）→ 自动归档从未真正运行过。
+#      现挂到 openbox autostart，与方舟服务同生命周期。
+#      关掉：WV_SCAN_HOUR=off 或 WV_MEDIA_AUTO=0
+# ---------------------------------------------------------------------------
+(
+    STORE="/data"; INBOX="/data/inbox"; LOGS="/data/logs"
+    RAW_INBOX="/data/inbox/raw"; RAW_SNAPS="/data/raw-snapshots"
+    MEDIA="/data/media"; PLAIN_DBS="/data/wx_backup/plain_dbs"
+    WX_FILES="/config/xwechat_files"
+    COLD="${WV_COLD:-/data-cold}"
+    SCAN_HOUR="${WV_SCAN_HOUR:-3}"
+    ARCHIVE_RAW="${WV_ARCHIVE_RAW:-1}"
+    SYNC_COLD="${WV_SYNC_COLD:-1}"
+    MEDIA_AUTO="${WV_MEDIA_AUTO:-1}"
+    PY_ARCH="/opt/wx-venv/bin/python3"
+    LAST_DAY=""
+    while true; do
+        NOW_H=$(date +%H); NOW_M=$(date +%M); DAY=$(date +%F)
+        if [ "$SCAN_HOUR" != "off" ] && [ "$NOW_H" = "$SCAN_HOUR" ] && [ "$NOW_M" -lt 5 ] && [ "$LAST_DAY" != "$DAY" ]; then
+            LAST_DAY="$DAY"
+            echo "[$(date '+%F %T')] 定时归档开始" >> "$LOGS/scan.log"
+            # ① 可读轨
+            "$PY_ARCH" /app/archiver/wv_archiver.py scan --source "$INBOX" --store "$STORE" \
+                --exclude-dir raw >> "$LOGS/scan.log" 2>&1 || true
+            # ② 存档轨
+            if [ "$ARCHIVE_RAW" = "1" ]; then
+                "$PY_ARCH" /app/archiver/wv_raw.py ingest \
+                    --source "$RAW_INBOX" --dest "$RAW_SNAPS" --manifest "$STORE/MANIFEST.json" \
+                    >> "$LOGS/scan.log" 2>&1 || true
+            fi
+            # ③ 媒体链路（新图解密 / 关联 / WxAM 原图 / 视频语音文件）
+            if [ "$MEDIA_AUTO" = "1" ] && [ -d "$PLAIN_DBS" ] && [ -d "$WX_FILES" ]; then
+                for acct in "$WX_FILES"/*/; do
+                    [ -d "${acct}msg/attach" ] || continue
+                    echo "[$(date '+%F %T')] 媒体链路: $acct" >> "$LOGS/scan.log"
+                    "$PY_ARCH" /app/archiver/wv_media.py all \
+                        --attach "${acct}msg/attach" --account-root "${acct%/}" \
+                        --vault "$STORE/vault.db" --plain-dbs "$PLAIN_DBS" --out "$MEDIA" \
+                        >> "$LOGS/scan.log" 2>&1 || true
+                    "$PY_ARCH" /app/archiver/wv_media.py extras \
+                        --attach "${acct}msg/attach" --account-root "${acct%/}" \
+                        --vault "$STORE/vault.db" --plain-dbs "$PLAIN_DBS" --out "$MEDIA" \
+                        >> "$LOGS/scan.log" 2>&1 || true
+                done
+            fi
+            # ④ 冷备
+            if [ "$SYNC_COLD" = "1" ] && [ -d "$COLD" ]; then
+                "$PY_ARCH" /app/archiver/wv_mirror.py --src "$STORE" --dst "$COLD" \
+                    --exclude logs >> "$LOGS/scan.log" 2>&1 || true
+            fi
+            # ⑤ 通知查看器重载
+            curl -s -X POST "http://127.0.0.1:${WV_PORT}/api/reload" >/dev/null 2>&1 || true
+            echo "[$(date '+%F %T')] 定时归档完成" >> "$LOGS/scan.log"
+            sleep 300
+        fi
+        sleep 60
+    done
+) &
+log "定时归档调度器已启动（日志见 /data/logs/scan.log）"
+
+# ---------------------------------------------------------------------------
 # 4) 清理微信崩溃转储（crashpad 会无限膨胀吃满磁盘）
 # ---------------------------------------------------------------------------
 if [ -d /config/.xwechat/crashinfo ]; then

@@ -352,16 +352,28 @@ def run_decode(attach: str, out: str, aes_key: bytes, xor_key: int,
 # 消息关联
 # ---------------------------------------------------------------------------
 
-def _plain_sizes(plain_dbs: str) -> dict[tuple, list[int]]:
-    """从解密明文库取每个图片消息的候选明文尺寸：{(chat_hash, 时间戳): [尺寸…]}"""
-    out: dict[tuple, list[int]] = {}
-    zbuf = zstd.ZstdDecompressor()
+_PLAIN_META_CACHE: dict = {}
 
-    def dec(b):
-        try:
-            return zbuf.decompress(b)
-        except Exception:
-            return b""
+
+def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
+    """一次扫描解密明文库，同时产出两份映射（避免把 817 张表扫两遍）。
+
+    返回 (sizes_map, thumb_map)：
+      sizes_map[(chat_hash, create_time)] -> [length/hdlength/cdnthumblength, ...]
+      thumb_map[(chat_hash, create_time)] -> [cdnthumblength, ...]
+
+    ⚠ 同一秒同一会话可能有多条图片消息（批量发图 / 转发多图），因此值是**列表**。
+    旧实现 `out[key] = 值` 会直接覆盖：实测 2054 个键冲突、
+    约 3780 条消息（4.9%）的尺寸信息被丢弃，导致这些图关联不上。
+    """
+    if plain_dbs in _PLAIN_META_CACHE:
+        return _PLAIN_META_CACHE[plain_dbs]
+
+    sizes_map: dict[tuple, list[int]] = {}
+    thumb_map: dict[tuple, list[int]] = {}
+    zbuf = zstd.ZstdDecompressor()
+    img_re = re.compile(rb"<img ([^>]*)>")
+    attr_re = re.compile(rb'([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"')
 
     for db in sorted(glob.glob(plain_dbs + "/message/message_*.db")):
         try:
@@ -376,25 +388,44 @@ def _plain_sizes(plain_dbs: str) -> dict[tuple, list[int]]:
                         "SELECT create_time, message_content FROM %s "
                         "WHERE local_type=3" % t).fetchall()
                 except sqlite3.Error as e:
-                    log.warning("读取明文库失败，该库尺寸信息整体缺失（会明显拉低关联命中率）：%s", e)
+                    log.warning("读取明文库失败，该会话尺寸信息缺失（会拉低关联命中率）：%s", e)
                     continue
                 for ct, mc in rows:
-                    m = re.search(rb"<img ([^>]*)>", dec(mc))
+                    try:
+                        txt = zbuf.decompress(mc)
+                    except Exception:
+                        continue
+                    m = img_re.search(txt)
                     if not m:
                         continue
-                    a = dict(re.findall(rb'([a-zA-Z0-9_]+)="([^"]*)"', m.group(1)))
+                    a = dict(attr_re.findall(m.group(1)))
                     sizes = []
                     for k in (b"length", b"hdlength", b"cdnthumblength"):
                         v = a.get(k)
                         if v and v.isdigit() and int(v) > 0:
                             sizes.append(int(v))
                     if sizes:
-                        out[(h, ct)] = sizes
+                        sizes_map.setdefault((h, ct), []).extend(sizes)
+                    tv = a.get(b"cdnthumblength")
+                    if tv and tv.isdigit() and int(tv) > 0:
+                        thumb_map.setdefault((h, ct), []).append(int(tv))
             c.close()
         except sqlite3.Error as e:
-            log.warning("消息表查询失败，该会话尺寸信息缺失，会拉低后续关联命中率：%s", e)
+            log.warning("消息表查询失败，该库尺寸信息缺失，会拉低后续关联命中率：%s", e)
             continue
-    return out
+
+    _PLAIN_META_CACHE[plain_dbs] = (sizes_map, thumb_map)
+    return sizes_map, thumb_map
+
+
+def _plain_sizes(plain_dbs: str) -> dict[tuple, list[int]]:
+    """图片消息候选明文尺寸（与缩略图尺寸共用一次扫描 + 缓存）。"""
+    return _plain_media_meta(plain_dbs)[0]
+
+
+def _plain_thumb_len(plain_dbs: str) -> dict[tuple, list[int]]:
+    """图片消息缩略图字节数（同秒多图时一个键对应多个值）。"""
+    return _plain_media_meta(plain_dbs)[1]
 
 def _username_of(source_file: str | None) -> str:
     if not source_file:
@@ -984,11 +1015,16 @@ def run_wxam(account_root: str, vault: str, out: str, workers: int = 3) -> dict:
         h = chash.get(_username_of(sf))
         if not h:
             continue
-        tlen = tl.get((h, ts))
-        if not tlen:
+        tlens = tl.get((h, ts)) or []
+        if not tlens:
             steps["无缩略图尺寸"] += 1
             continue
-        stem = thumb.get((h, _month8(ts), tlen))
+        # 同秒多图 → 多个候选尺寸，任一命中即可（旧实现只取最后一个，会漏）
+        stem = None
+        for _tlen in tlens:
+            stem = thumb.get((h, _month8(ts), _tlen))
+            if stem:
+                break
         if not stem:
             steps["缩略图未匹配"] += 1
             continue
@@ -1074,44 +1110,6 @@ def _wx_worker(path):
             pass
     return ("orig", path, len(inner), stem, rel)
 
-def _plain_thumb_len(plain_dbs: str) -> dict:
-    """(会话哈希, create_time) → cdnthumblength（缩略图明文字节数）。"""
-    out: dict[tuple, int] = {}
-    zb = zstd.ZstdDecompressor()
-
-    def dec(b):
-        try:
-            return zb.decompress(b)
-        except Exception:
-            return b""
-
-    for db in sorted(glob.glob(plain_dbs + "/message/message_*.db")):
-        try:
-            c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
-            tabs = [r[0] for r in c.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name LIKE 'Msg\\_%' ESCAPE '\\'")]
-            for t in tabs:
-                h = t[4:]
-                try:
-                    rows = c.execute("SELECT create_time, message_content FROM %s "
-                                     "WHERE local_type=3" % t).fetchall()
-                except sqlite3.Error as e:
-                    log.warning("读取明文库失败，该库缩略图尺寸整体缺失：%s", e)
-                    continue
-                for ct, mc in rows:
-                    m = re.search(rb"<img ([^>]*)>", dec(mc))
-                    if not m:
-                        continue
-                    a = dict(re.findall(rb'([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"', m.group(1)))
-                    v = a.get(b"cdnthumblength")
-                    if v and v.isdigit() and int(v) > 0:
-                        out[(h, ct)] = int(v)
-            c.close()
-        except sqlite3.Error as e:
-            log.warning("消息表查询失败，该会话缩略图尺寸缺失：%s", e)
-            continue
-    return out
 
 def _plain_root(out: str = "") -> str:
     """解密明文库目录（wv_media 多处复用）。"""
