@@ -1,33 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-wv_sync.py —— 从微信客户端数据库直接同步消息到 vault.db
-
-链路：
-    微信 db（SQLCipher 加密）
-      → sqlcipher CLI 解密
-      → 读 contact/session/message_*.db
-      → 写 vault.db（conv + msg）
-
-与 wv_archiver 的关系：
-    wv_archiver 处理「导出文件」（JSON/TXT/CSV），本模块处理「微信原始库」。
-    两者写同一张 vault.db，靠 msg_id 前缀区分来源（json- / db-）。
-
-通用性：
-    · 账号目录自动发现（不假设 wxid）
-    · 所有路径走参数或环境变量，不写死部署位置
-    · 兼容 all_keys.json 的两种格式
-    · 解密依赖外部 sqlcipher 命令（Dockerfile 已装），也可用 WV_SQLCIPHER 指定
-
-用法：
-    python wv_sync.py story \
-        --wechat-files /config/xwechat_files \
-        --keys /data/wx_backup/all_keys.json \
-        --vault /data/vault.db \
-        --plain-out /data/wx_backup/plain_dbs
-
-    python wv_sync.py decrypt ...    # 只解密，不写库
-"""
+"""从微信客户端数据库同步消息到 vault.db。"""
 from __future__ import annotations
 
 import argparse
@@ -58,50 +30,33 @@ log = logging.getLogger("wv_sync")
 DEFAULT_ACCOUNT = "默认账号"
 MSG_PREFIX = "db-"
 
-# SQLCipher 4 页布局常量（与公开实现交叉验证一致）
 _PAGE_SZ = 4096
-_RESERVE = 80       # IV(16) + HMAC(64)
+_RESERVE = 80
 _IV_OFF = 4016
 _HMAC_OFF = 4032
 _SALT_SZ = 16
 
-# local_type 低 32 位 → 我方 type
 BASE_TYPE = {
     1: "text", 3: "image", 34: "voice", 37: "friend", 42: "card",
     43: "video", 47: "emoji", 48: "location", 49: "link",
     50: "call", 10000: "system", 10002: "revoke",
 }
 
-
-# ---------------------------------------------------------------------------
-# 密钥
-# ---------------------------------------------------------------------------
-
 def load_keys(keys_path: Path) -> dict:
-    """读取 all_keys.json，返回 {相对路径: (enc_key_hex, salt_hex)}。
-
-    兼容两种格式：
-      A. {"message/message_0.db": {"enc_key": "...", "salt": "..."}}   ← 当前
-      B. {"db_dir": "...", "keys": {"message/message_0.db": "enc_key"}} ← wv_wxdb 期望
-    """
+    """读取 all_keys.json，返回 {相对路径: (enc_key_hex, salt_hex)}。"""
     raw = json.loads(keys_path.read_text(encoding="utf-8"))
     out: dict[str, tuple[str, str]] = {}
     if "keys" in raw and isinstance(raw["keys"], dict):
         for k, v in raw["keys"].items():
-            out[k] = (v, "")          # 只有 enc_key，salt 从文件头读
+            out[k] = (v, "")
         return out
     for k, v in raw.items():
         if isinstance(v, dict) and v.get("enc_key"):
             out[k] = (v["enc_key"], v.get("salt", ""))
     return out
 
-
-def load_password(keys_path: Path) -> str:
-    """读取同目录 passphrase.json 里的账号级 password（64 hex）。
-
-    password 是账号级、长期稳定的；用它 + 各库文件头 salt 派生 enc_key，
-    能覆盖「库被重建、all_keys.json 里的 enc_key 快照失效」的情况。
-    """
+def load_passphrase(keys_path: Path) -> str:
+    """读取同目录 passphrase.json 里的账号级 password（64 hex）。"""
     cand = keys_path.parent / "passphrase.json"
     if not cand.is_file():
         return ""
@@ -110,7 +65,6 @@ def load_password(keys_path: Path) -> str:
         return v if (isinstance(v, str) and len(v) == 64) else ""
     except (ValueError, OSError):
         return ""
-
 
 def find_account(wechat_files: Path, wxid: str = "") -> Path:
     """在 xwechat_files 下定位账号目录（含 db_storage 的那个）。"""
@@ -123,26 +77,14 @@ def find_account(wechat_files: Path, wxid: str = "") -> Path:
             return hit[0]
     return sorted(cands)[0]
 
-
-# ---------------------------------------------------------------------------
-# 解密
-# ---------------------------------------------------------------------------
-
 def _mac_key(enc_key: bytes, salt: bytes) -> bytes:
     """SQLCipher 4 的 HMAC 校验 key：PBKDF2(enc_key, salt^0x3a, 2 轮)。"""
     mac_salt = bytes(b ^ 0x3A for b in salt)
     return hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=32)
 
-
 def decrypt_one(src: Path, dst: Path, enc_key: str, salt: str = "",
-                sqlcipher: str = "", password: str = "") -> bool:
-    """纯 Python 解密单个 SQLCipher 4 库（不依赖外部 sqlcipher）。
-
-    优先用账号级 password 派生 enc_key（password + 文件头 salt → PBKDF2 256000），
-    这样即使库被重建、all_keys.json 里的 enc_key 快照失效也能解。
-    没有 password 时，退回到把 enc_key 当最终 AES key 直接用。
-    每页布局：[0:4016]=密文 | [4016:4032]=IV | [4032:4096]=HMAC。
-    """
+                sqlcipher: str = "", passphrase_hex: str = "") -> bool:
+    """纯 Python 解密单个 SQLCipher 4 库（不依赖外部 sqlcipher）。"""
     if _AES is None:
         log.error("缺少 pycryptodome，无法解密")
         return False
@@ -155,10 +97,10 @@ def decrypt_one(src: Path, dst: Path, enc_key: str, salt: str = "",
         return False
 
     salt_bytes = blob[:_SALT_SZ]
-    if password:
-        pw = password.strip().lower()
+    if passphrase_hex:
+        pw = passphrase_hex.strip().lower()
         if len(pw) != 64:
-            log.error("password 长度异常：%s", src.name)
+            log.error("passphrase 长度异常：%s", src.name)
             return False
         aes_key = hashlib.pbkdf2_hmac("sha512", bytes.fromhex(pw),
                                       salt_bytes, 256000, dklen=32)
@@ -186,9 +128,8 @@ def decrypt_one(src: Path, dst: Path, enc_key: str, salt: str = "",
     dst.write_bytes(bytes(out))
     return True
 
-
 def decrypt_all(account: Path, plain_out: Path, keys: dict,
-                sqlcipher: str = "", password: str = "") -> int:
+                sqlcipher: str = "", passphrase_hex: str = "") -> int:
     """解密 db_storage 下所有库，保持相对路径结构。返回成功数。"""
     db_dir = account / "db_storage"
     ok = 0
@@ -200,26 +141,16 @@ def decrypt_all(account: Path, plain_out: Path, keys: dict,
             log.debug("无密钥，跳过：%s", rel)
             continue
         total += 1
-        if decrypt_one(src, plain_out / rel, ent[0], ent[1], password=password):
+        if decrypt_one(src, plain_out / rel, ent[0], ent[1], passphrase_hex=passphrase_hex):
             ok += 1
     log.info("解密完成：%d/%d", ok, total)
     return ok
 
-
-# ---------------------------------------------------------------------------
-# 读取
-# ---------------------------------------------------------------------------
-
 def _ro(p: Path) -> sqlite3.Connection:
     return sqlite3.connect("file:%s?mode=ro" % p, uri=True)
 
-
 def read_contacts(plain: Path) -> dict[int, dict]:
-    """contact.id → {username, remark, nick}（real_sender_id 的映射源）。
-
-    表结构在不同微信版本间有差异，读不到就退回空表（发送者显示数字 ID），
-    不让单个库的差异中断整条同步。
-    """
+    """contact.id → {username, remark, nick}（real_sender_id 的映射源）。"""
     out: dict[int, dict] = {}
     p = plain / "contact" / "contact.db"
     if not p.is_file():
@@ -237,7 +168,6 @@ def read_contacts(plain: Path) -> dict[int, dict]:
     finally:
         c.close()
     return out
-
 
 def read_sessions(plain: Path) -> dict[str, str]:
     """username → 会话标识（用于 md5 反查）。表缺失时返回空。"""
@@ -258,7 +188,6 @@ def read_sessions(plain: Path) -> dict[str, str]:
         c.close()
     return out
 
-
 def _decompress(v, zb) -> str:
     """message_content 可能是 TEXT 或 zstd 压缩的 BLOB（WCDB_CT_* = 4）。"""
     if v is None:
@@ -267,22 +196,18 @@ def _decompress(v, zb) -> str:
         if zb is not None:
             try:
                 return zb.decompress(v).decode("utf-8", "replace")
-            except Exception:      # 该行内容并非 zstd 压缩，属预期，退回原始解码
+            except Exception:
+                log.debug("zstd decompress failed, fallback to raw")
                 pass
         return v.decode("utf-8", "replace")
     return str(v)
 
-
 def _strip_sender(text: str) -> tuple[str, str]:
-    """群聊 content 形如 `发送者: 正文`，拆出前缀。
-
-    只在前缀不含空格且长度合理时拆，避免把正文里的冒号误当分隔。
-    """
+    """群聊 content 形如 `发送者: 正文`，拆出前缀。"""
     i = text.find(": ")
     if 0 < i <= 64 and "\n" not in text[:i]:
         return text[:i], text[i + 2:]
     return "", text
-
 
 def _xml_field(text: str, tag: str) -> str:
     """从消息 XML 里取一个简单字段（不引入 XML 解析器的开销）。"""
@@ -292,7 +217,6 @@ def _xml_field(text: str, tag: str) -> str:
     a += len(tag) + 2
     b = text.find("</%s>" % tag, a)
     return text[a:b] if b > a else ""
-
 
 def _summarize(base: str, body: str) -> str:
     """非文字消息给出可读摘要，正文留在原 XML 里由媒体链路处理。"""
@@ -316,11 +240,6 @@ def _summarize(base: str, body: str) -> str:
         return "[消息已撤回]"
     return body
 
-
-# ---------------------------------------------------------------------------
-# 写库
-# ---------------------------------------------------------------------------
-
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """确保 vault.db 有 conv/msg 表（与 wv_archiver 的 schema 一致）。"""
     conn.executescript("""
@@ -343,14 +262,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_conv_account ON conv(account);
     """)
 
-
 def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                   since_ts: int = 0, limit_tables: int = 0,
                   self_wxid: str = "") -> dict:
     """读 plain 库里的全部 Msg_* 表，写入 vault.db。返回统计。"""
     contacts = read_contacts(plain)
     sessions = read_sessions(plain)
-    # 自己：用账号 wxid（目录名去设备后缀），与 contact.username 对齐
     me = self_wxid or (account_name.split("_")[0] if "_" in account_name else account_name)
     self_ids = {i for i, v in contacts.items() if v["username"] == me}
 
@@ -361,8 +278,6 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
 
     stats = {"conv": 0, "msg": 0, "skip_dup": 0, "tables": 0}
     msg_db = plain / "message"
-    # 只匹配数字索引的消息库（message_0/1/2/3），
-    # message_fts / message_resource 是别的用途，混进来会读坏文件
     files = sorted(msg_db.glob("message_[0-9]*.db")) if msg_db.is_dir() else []
     if limit_tables:
         files = files[:limit_tables]
@@ -383,7 +298,6 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             continue
         for t in tabs:
             h = t[4:]
-            # 反查会话名：md5(username) == h
             username = next((u for u in sessions if hashlib.md5(u.encode()).hexdigest() == h), "")
             if not username:
                 continue
@@ -409,15 +323,12 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                 content_out = _summarize(base, body)
                 mid = MSG_PREFIX + hashlib.sha1(
                     ("%s|%s|%s" % (cid, local_id, ctime)).encode()).hexdigest()[:12]
-                # source_file 的 basename 是显示名（群名/备注），wv_media.py 据此
-                # 反查 md5(username) 做媒体关联；不能用 username 或 db 路径
                 batch.append((mid, cid, account_name, local_id, ctime,
                               time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ctime)),
                               sender, is_self, base, content_out,
                               "/wxdb/%s" % ctitle, now))
             if not batch:
                 continue
-            # 先按 (conv_id, ts, content) 查重，避免与 wv_archiver 从 JSON 导入的重复
             fresh = []
             for b in batch:
                 dup = conn.execute(
@@ -453,18 +364,12 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
     conn.close()
     return stats
 
-
 def _display_title(username: str, contacts: dict[int, dict], sessions: dict[str, str]) -> str:
     """会话显示名：群聊用群名，单聊用备注/昵称。"""
     for v in contacts.values():
         if v["username"] == username:
             return v["remark"] or v["nick"] or username
     return sessions.get(username, username)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="从微信客户端数据库同步消息到 vault.db")
@@ -499,12 +404,12 @@ def main() -> int:
         return 2
     keys = load_keys(keys_path)
     log.info("密钥：%d 个库", len(keys))
-    password = load_password(keys_path)
-    if password:
-        log.info("检测到 passphrase.json，将用账号级 password 派生各库密钥")
+    passphrase_hex = load_passphrase(keys_path)
+    if passphrase_hex:
+        log.info("检测到 passphrase.json，将用账号级 passphrase 派生各库密钥")
 
     plain = Path(a.plain_out)
-    n = decrypt_all(account, plain, keys, a.sqlcipher, password)
+    n = decrypt_all(account, plain, keys, a.sqlcipher, passphrase_hex)
     if n == 0:
         log.error("没有任何库解密成功")
         return 1
@@ -516,7 +421,6 @@ def main() -> int:
     log.info("同步完成：%d 个会话表 / 新增 %d 条消息 / 跳过重复 %d 条",
              stats["tables"], stats["msg"], stats["skip_dup"])
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

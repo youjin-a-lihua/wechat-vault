@@ -1,32 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-wv_wxdb.py —— 微信 4.x SQLCipher4 数据库解密器（纯 Python，零第三方依赖）
-
-对标微备份路线：
-    WCDB 用 SQLCipher 4 加密本地库（AES-256-CBC + HMAC-SHA512 + 256000 轮 PBKDF2）。
-    all_keys.json 里存的是 96 hex = enc_key(32B) + salt(16B)。
-    实际上微信所有库共用同一个 enc_key，salt 每库不同（存在 page1 前 16 字节）。
-
-SQLCipher4 page 布局：
-    page_size = 4096
-    reserve   = 48   （每页尾部预留）
-    usable    = 4096 - 48 = 4048
-    page1 = salt(16) || ciphertext[0:4032] || hmac(64)
-           其中 ciphertext 起点 = 4096 - 48 + 16 = 4064（page1 偏移）
-           即 page1 的密文区从 offset 16 开始，长度 4048 - 16 = 4032
-    其余页 pageN = ciphertext[0:4048] || hmac(64)
-    IV = 从 0 开始、每页 +1 的随机（SQLCipher4 用 page number 作为 IV 明文）
-
-解密流程：
-    1. mac_key    = PBKDF2(enc_key, salt, 256000, 32, sha512)
-    2. key        = PBKDF2(enc_key, salt ^ 0x3a, 256000, 32, sha512)   ← 注意异或
-    3. HMAC(page1[16:4096-64+16]) 与 page1[4096-64:4096]（先与 mac_key[:64] 异或）比对
-    4. AES-256-CBC 解密，IV = 1..N 的 4 字节大端 + 12 字节 0
-
-依赖：只有标准库。AES-256-CBC 用纯 Python 实现（慢但可靠），
-      若本机有 cryptography/pycryptodome 会自动优先使用。
-"""
+"""微信 4.x SQLCipher 数据库解密。"""
 
 from __future__ import annotations
 
@@ -43,16 +16,13 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------- AES 后端
-
 _AES_BACKEND = "pure"
-
 
 def _load_aes():
     """优先用原生 AES（快 100x），没有就退回纯 Python"""
     global _AES_BACKEND
     try:
-        from Crypto.Cipher import AES  # pycryptodome
+        from Crypto.Cipher import AES
         _AES_BACKEND = "pycryptodome"
         return ("pycryptodome", AES)
     except ImportError as e:
@@ -68,7 +38,6 @@ def _load_aes():
     _AES_BACKEND = "pure"
     return ("pure", None)
 
-
 def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
     """AES-CBC 解密（无 padding 处理，调用方按块对齐）"""
     name, mod = _load_aes()
@@ -82,12 +51,8 @@ def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
         return d.update(data) + d.finalize()
     return _pure_aes_cbc_decrypt(key, iv, data)
 
-
-# ------------------------------------------------ 纯 Python AES-256-CBC（兜底）
-
 _SBOX = None
 _RCON = None
-
 
 def _init_tables():
     global _SBOX, _RCON
@@ -117,7 +82,6 @@ def _init_tables():
         rcon.append(v & 0xFF)
     _RCON = rcon
 
-
 def _expand_key_256(key: bytes):
     """AES-256 密钥扩展 → 60 个 4 字节字"""
     _init_tables()
@@ -134,11 +98,9 @@ def _expand_key_256(key: bytes):
         w.append([w[i - nk][j] ^ t[j] for j in range(4)])
     return w
 
-
 def _inv_shift_rows(s):
     return [s[0], s[13], s[10], s[7], s[4], s[1], s[14], s[11],
             s[8], s[5], s[2], s[15], s[12], s[9], s[6], s[3]]
-
 
 def _gf_mul(a, b):
     r = 0
@@ -152,11 +114,9 @@ def _gf_mul(a, b):
         b >>= 1
     return r
 
-
 def _decrypt_block(block: bytes, w) -> bytes:
     _init_tables()
     s = list(block)
-    # AddRoundKey (last)
     rk = sum(w[56:60], [])
     s = [s[i] ^ rk[i] for i in range(16)]
     for rnd in range(13, 0, -1):
@@ -164,7 +124,6 @@ def _decrypt_block(block: bytes, w) -> bytes:
         s = [_INV_SBOX[b] for b in s]
         rk = sum(w[4 * rnd:4 * rnd + 4], [])
         s = [s[i] ^ rk[i] for i in range(16)]
-        # InvMixColumns
         out = [0] * 16
         for c in range(4):
             a0, a1, a2, a3 = s[4 * c:4 * c + 4]
@@ -178,9 +137,7 @@ def _decrypt_block(block: bytes, w) -> bytes:
     rk = sum(w[0:4], [])
     return bytes(s[i] ^ rk[i] for i in range(16))
 
-
 _INV_SBOX = None
-
 
 def _init_inv_sbox():
     global _INV_SBOX
@@ -191,7 +148,6 @@ def _init_inv_sbox():
     for i, v in enumerate(_SBOX):
         inv[v] = i
     _INV_SBOX = inv
-
 
 def _pure_aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
     _init_inv_sbox()
@@ -205,30 +161,19 @@ def _pure_aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
         prev = blk
     return bytes(out)
 
-
-# --------------------------------------------------------------- SQLCipher 解密
-
 PAGE_SZ = 4096
-RESERVE = 80       # 每页尾部预留：IV(16) + HMAC(64)
-IV_OFF = 4016      # 每页 IV 的偏移
-HMAC_OFF = 4032    # 每页 HMAC 的偏移
-KDF_ITER = 256000  # password → enc_key 的 PBKDF2 轮数
+RESERVE = 80
+IV_OFF = 4016
+HMAC_OFF = 4032
+KDF_ITER = 256000
 KEY_SZ = 32
 SALT_SZ = 16
 
-
 def derive_keys(enc_key: bytes, salt: bytes) -> tuple[bytes, bytes]:
-    """SQLCipher 4：enc_key 已是最终 AES key，只需派生 HMAC 校验 key。
-
-    规范（与公开实现交叉验证一致）：
-      mac_key = PBKDF2-HMAC-SHA512(enc_key, salt ^ 0x3a, 2 轮, dklen=32)
-    注意 mac_key 是 2 轮，不是 256000 轮；256000 轮只在
-    password → enc_key 那一跳发生，而 all_keys.json 里存的已经是 enc_key。
-    """
+    """SQLCipher 4：enc_key 已是最终 AES key，只需派生 HMAC 校验 key。"""
     mac_salt = bytes(b ^ 0x3A for b in salt)
     mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
     return enc_key, mac_key
-
 
 def verify(enc_key: bytes, db_path: Path) -> bool:
     """校验 page1 的 HMAC（SQLCipher 4 布局）。"""
@@ -239,7 +184,6 @@ def verify(enc_key: bytes, db_path: Path) -> bool:
             return False
         salt = page1[:SALT_SZ]
         _, mac_key = derive_keys(enc_key, salt)
-        # HMAC 覆盖 page1[16:4032]（密文+IV）+ 小端页号 1
         hmac_data = page1[SALT_SZ:HMAC_OFF] + struct.pack("<I", 1)
         mac = hmac.new(mac_key, hmac_data, hashlib.sha512).digest()
         stored = page1[HMAC_OFF:HMAC_OFF + 64]
@@ -247,13 +191,8 @@ def verify(enc_key: bytes, db_path: Path) -> bool:
     except Exception:
         return False
 
-
 def decrypt_db(enc_key: bytes, src: Path, dst: Path) -> bool:
-    """解密单个 SQLCipher4 数据库 → 明文 SQLite。
-
-    每页布局：[:4016]=密文 | [4016:4032]=IV | [4032:4096]=HMAC。
-    page1 的前 16 字节是明文 salt，故密文区是 [16:4016]。
-    """
+    """解密单个 SQLCipher4 数据库 → 明文 SQLite。"""
     try:
         with open(src, "rb") as f:
             blob = f.read()
@@ -269,9 +208,9 @@ def decrypt_db(enc_key: bytes, src: Path, dst: Path) -> bool:
     n_pages = len(blob) // PAGE_SZ
     for pi in range(n_pages):
         page = blob[pi * PAGE_SZ:(pi + 1) * PAGE_SZ]
-        iv = page[IV_OFF:HMAC_OFF]           # 每页自带 IV
+        iv = page[IV_OFF:HMAC_OFF]
         if pi == 0:
-            ct = page[SALT_SZ:IV_OFF]         # 跳过 salt
+            ct = page[SALT_SZ:IV_OFF]
             pt = _aes_cbc_decrypt(aes_key, iv, ct)
             out += b"SQLite format 3\x00" + pt + b"\x00" * RESERVE
         else:
@@ -279,7 +218,6 @@ def decrypt_db(enc_key: bytes, src: Path, dst: Path) -> bool:
             pt = _aes_cbc_decrypt(aes_key, iv, ct)
             out += pt + b"\x00" * RESERVE
 
-    # 截到原始大小（去掉每页 reserve 的填充差异），并修正 page1 头
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         with open(dst, "wb") as f:
@@ -287,9 +225,6 @@ def decrypt_db(enc_key: bytes, src: Path, dst: Path) -> bool:
         return True
     except Exception:
         return False
-
-
-# -------------------------------------------------------------------- 主流程
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="微信 4.x 数据库解密（SQLCipher4）")
@@ -328,7 +263,6 @@ def main() -> int:
         sz = src.stat().st_size
         t1 = time.time()
         if decrypt_db(enc_key, src, dst):
-            # 验证解出来的是不是合法 SQLite
             with open(dst, "rb") as f:
                 magic = f.read(16)
             good = magic.startswith(b"SQLite format 3")
@@ -341,7 +275,6 @@ def main() -> int:
             print(f"  [!!] {rel}  解密失败")
     print(f"\n[✓] 完成：{ok} 个库解密成功，耗时 {time.time()-t0:.1f}s")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

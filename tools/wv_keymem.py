@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""wv_keymem.py —— 从运行中的微信进程内存里定位 SQLCipher 密钥（Linux）
-
-原理：
-    WCDB 打开数据库时会把 salt 与 enc_key 一起缓存在进程内存里。
-    salt 是明文存在每个库文件的前 16 字节，所以拿 salt 当锚点去内存里搜，
-    命中位置附近通常就能捞到 32 字节的 enc_key。
-
-    比 gdb 下断点可靠：不需要精确时序，微信登录后内存里一直有。
-
-用法：
-    python wv_keymem.py --account-dir /config/xwechat_files/<wxid>_xxx --out /tmp/keys.json
-"""
+"""从微信进程内存定位 SQLCipher 密钥。"""
 from __future__ import annotations
 
 import argparse
@@ -32,13 +20,11 @@ SALT_SZ = 16
 PAGE_SZ = 4096
 RESERVE = 48
 
-
 def derive(enc_key: bytes, salt: bytes):
     mac_salt = bytes(b ^ 0x3A for b in salt)
     aes = hashlib.pbkdf2_hmac("sha512", enc_key, salt, KDF_ITER, dklen=KEY_SZ)
     mac = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, KDF_ITER, dklen=KEY_SZ)
     return aes, mac
-
 
 def verify_key(enc_key: bytes, db_path: Path) -> bool:
     """用 page1 末尾的 HMAC 校验候选 key 是否真的是这个库的密钥。"""
@@ -57,7 +43,6 @@ def verify_key(enc_key: bytes, db_path: Path) -> bool:
     return hmac.compare_digest(mac, stored) or \
         hmac.compare_digest(mac, bytes(a ^ b for a, b in zip(stored, mac_key[:64])))
 
-
 def readable_regions(pid: int):
     """列出进程可读的内存区间（跳过文件映射，只扫匿名/堆）。"""
     out = []
@@ -67,19 +52,18 @@ def readable_regions(pid: int):
                 parts = line.split()
                 if len(parts) < 2 or "r" not in parts[1]:
                     continue
-                # 只扫匿名映射，跳过 .so / 可执行文件（省时间）
                 path = parts[5] if len(parts) > 5 else ""
                 if path.endswith((".so", ".so.1")) or "/opt/wechat" in path:
                     continue
                 a, b = parts[0].split("-")
                 start, end = int(a, 16), int(b, 16)
-                if end - start > 512 * 1024 * 1024:      # 跳过超大映射
+                if end - start > 512 * 1024 * 1024:
                     continue
                 out.append((start, end))
-    except OSError:            # /proc/<pid>/maps 读失败：进程已退出或权限不足，返回空集
+    except OSError:
+        log.debug("maps unreadable")
         pass
     return out
-
 
 def scan(pid: int, salt: bytes, db_path: Path, max_hits: int = 4000):
     """在内存里搜 salt，在其附近按 32 字节窗口尝试 enc_key。"""
@@ -97,7 +81,8 @@ def scan(pid: int, salt: bytes, db_path: Path, max_hits: int = 4000):
             try:
                 mem.seek(start)
                 data = mem.read(size)
-            except (OSError, ValueError):   # 该内存段不可读（已 unmap 或受保护），跳过
+            except (OSError, ValueError):
+                log.debug("region unreadable, skip")
                 continue
             if not data:
                 continue
@@ -108,7 +93,6 @@ def scan(pid: int, salt: bytes, db_path: Path, max_hits: int = 4000):
                     break
                 off = i + 1
                 hits += 1
-                # salt 前面 32 字节 / 后面 32 字节 / 紧邻前后各取窗口
                 lo = max(0, i - 64)
                 hi = min(len(data), i + SALT_SZ + 64)
                 window = data[lo:hi]
@@ -127,19 +111,18 @@ def scan(pid: int, salt: bytes, db_path: Path, max_hits: int = 4000):
     log.warning("共 %d 个 salt 命中点，均未通过 HMAC 校验", hits)
     return None
 
-
 def find_pid(pattern: str = "opt/wechat/wechat") -> int:
     for d in Path("/proc").iterdir():
         if not d.name.isdigit():
             continue
         try:
             cmd = (d / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
-        except OSError:        # 读 /proc 条目失败：进程可能在扫描期间退出，跳过
+        except OSError:
+            log.debug("cmdline unreadable, skip")
             continue
         if pattern in cmd and "crashpad" not in cmd:
             return int(d.name)
     return 0
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="从微信进程内存定位 SQLCipher 密钥")
@@ -179,7 +162,6 @@ def main() -> int:
         log.info("已写入 %s", a.out)
     print(text)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
