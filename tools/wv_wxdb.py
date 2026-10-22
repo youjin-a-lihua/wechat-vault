@@ -209,27 +209,29 @@ def _pure_aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
 # --------------------------------------------------------------- SQLCipher 解密
 
 PAGE_SZ = 4096
-RESERVE = 48
-KDF_ITER = 256000
+RESERVE = 80       # 每页尾部预留：IV(16) + HMAC(64)
+IV_OFF = 4016      # 每页 IV 的偏移
+HMAC_OFF = 4032    # 每页 HMAC 的偏移
+KDF_ITER = 256000  # password → enc_key 的 PBKDF2 轮数
 KEY_SZ = 32
 SALT_SZ = 16
 
 
 def derive_keys(enc_key: bytes, salt: bytes) -> tuple[bytes, bytes]:
-    """按 SQLCipher 4 规范派生 (aes_key, mac_key)。
+    """SQLCipher 4：enc_key 已是最终 AES key，只需派生 HMAC 校验 key。
 
-    规范：加密 key 用原始 salt，MAC key 用 salt ^ 0x3a。
-    早期版本把两者写反了 —— salt 与 enc_key 都对，但 AES 解出来是随机字节，
-    表现为「文件头能对上、sqlite3 却说 file is not a database」。
+    规范（与公开实现交叉验证一致）：
+      mac_key = PBKDF2-HMAC-SHA512(enc_key, salt ^ 0x3a, 2 轮, dklen=32)
+    注意 mac_key 是 2 轮，不是 256000 轮；256000 轮只在
+    password → enc_key 那一跳发生，而 all_keys.json 里存的已经是 enc_key。
     """
     mac_salt = bytes(b ^ 0x3A for b in salt)
-    aes_key = hashlib.pbkdf2_hmac("sha512", enc_key, salt, KDF_ITER, dklen=KEY_SZ)
-    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, KDF_ITER, dklen=KEY_SZ)
-    return aes_key, mac_key
+    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
+    return enc_key, mac_key
 
 
 def verify(enc_key: bytes, db_path: Path) -> bool:
-    """校验 page1 HMAC"""
+    """校验 page1 的 HMAC（SQLCipher 4 布局）。"""
     try:
         with open(db_path, "rb") as f:
             page1 = f.read(PAGE_SZ)
@@ -237,21 +239,21 @@ def verify(enc_key: bytes, db_path: Path) -> bool:
             return False
         salt = page1[:SALT_SZ]
         _, mac_key = derive_keys(enc_key, salt)
-        # SQLCipher4: HMAC 覆盖 page1[16 : 4096-48]，但官方实现是
-        #   hmac_data = page1[offset=SALT_SZ : offset+size-RESERVE]
-        #   即 page1[16 : 4096-48] → 长度 4032
-        hmac_data = page1[SALT_SZ:PAGE_SZ - RESERVE]
+        # HMAC 覆盖 page1[16:4032]（密文+IV）+ 小端页号 1
+        hmac_data = page1[SALT_SZ:HMAC_OFF] + struct.pack("<I", 1)
         mac = hmac.new(mac_key, hmac_data, hashlib.sha512).digest()
-        stored = page1[PAGE_SZ - RESERVE:PAGE_SZ - RESERVE + 64]
-        # SQLCipher4 的认证标签不与 mac_key 异或（3.x 才异或）
-        return hmac.compare_digest(mac, stored) or \
-            hmac.compare_digest(mac, bytes(a ^ b for a, b in zip(stored, mac_key[:64])))
+        stored = page1[HMAC_OFF:HMAC_OFF + 64]
+        return hmac.compare_digest(mac, stored)
     except Exception:
         return False
 
 
 def decrypt_db(enc_key: bytes, src: Path, dst: Path) -> bool:
-    """解密单个 SQLCipher4 数据库 → 明文 SQLite"""
+    """解密单个 SQLCipher4 数据库 → 明文 SQLite。
+
+    每页布局：[:4016]=密文 | [4016:4032]=IV | [4032:4096]=HMAC。
+    page1 的前 16 字节是明文 salt，故密文区是 [16:4016]。
+    """
     try:
         with open(src, "rb") as f:
             blob = f.read()
@@ -261,30 +263,21 @@ def decrypt_db(enc_key: bytes, src: Path, dst: Path) -> bool:
         return False
 
     salt = blob[:SALT_SZ]
-    aes_key, mac_key = derive_keys(enc_key, salt)
+    aes_key, _ = derive_keys(enc_key, salt)
 
     out = bytearray()
     n_pages = len(blob) // PAGE_SZ
     for pi in range(n_pages):
         page = blob[pi * PAGE_SZ:(pi + 1) * PAGE_SZ]
+        iv = page[IV_OFF:HMAC_OFF]           # 每页自带 IV
         if pi == 0:
-            # page1: 跳过前 16B salt，密文长度 = 4096-16-48 = 4032
-            ct = page[SALT_SZ:PAGE_SZ - RESERVE]
-            iv = struct.pack(">I", pi + 1) + b"\x00" * 12
-            ct = ct[:len(ct) - (len(ct) % 16)]
+            ct = page[SALT_SZ:IV_OFF]         # 跳过 salt
             pt = _aes_cbc_decrypt(aes_key, iv, ct)
-            out += b"SQLite format 3\x00"
-            out += pt
-            # 必须补满 reserve，否则 page1 只有 4048 字节、后续页全部错位，
-            # 文件头虽是 "SQLite format 3" 但 sqlite3 会报 file is not a database
-            out += b"\x00" * RESERVE
+            out += b"SQLite format 3\x00" + pt + b"\x00" * RESERVE
         else:
-            ct = page[:PAGE_SZ - RESERVE]
-            iv = struct.pack(">I", pi + 1) + b"\x00" * 12
-            ct = ct[:len(ct) - (len(ct) % 16)]
+            ct = page[:IV_OFF]
             pt = _aes_cbc_decrypt(aes_key, iv, ct)
-            out += pt
-            out += b"\x00" * RESERVE  # 预留区清零
+            out += pt + b"\x00" * RESERVE
 
     # 截到原始大小（去掉每页 reserve 的填充差异），并修正 page1 头
     try:
