@@ -1,0 +1,34 @@
+# 换行符策略 —— 避免 Windows 用户 clone 后 shell 脚本变成 CRLF
+# 背景：本仓库在 Windows 上开发、部署到 Linux(NAS)。
+#   core.autocrlf=true 时 checkout 默认转 CRLF，而 sh 脚本带 \r 会直接执行失败
+#   （报 "bad interpreter" 或变量名后面多一个 \r）。
+* text=auto eol=lf
+
+# 所有 shell 脚本 / 容器入口 强制 LF
+*.sh      text eol=lf
+*.bash    text eol=lf
+deploy/*  text eol=lf
+*.py      text eol=lf
+*.js      text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+*.md      text eol=lf
+Dockerfile* text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# Windows 专有脚本必须是 CRLF（否则 cmd.exe 解析异常）
+*.ps1     text eol=crlf
+*.cmd     text eol=crlf
+*.bat     text eol=crlf
+
+# 二进制（禁止任何换行转换）
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.webp    binary
+*.ico     binary
+*.mp4     binary
+*.db      binary
+*.tar.gz  binary
