@@ -76,7 +76,7 @@ def readable_regions(pid: int):
                 if end - start > 512 * 1024 * 1024:      # 跳过超大映射
                     continue
                 out.append((start, end))
-    except OSError:
+    except OSError:            # /proc/<pid>/maps 读失败：进程已退出或权限不足，返回空集
         pass
     return out
 
@@ -97,7 +97,7 @@ def scan(pid: int, salt: bytes, db_path: Path, max_hits: int = 4000):
             try:
                 mem.seek(start)
                 data = mem.read(size)
-            except (OSError, ValueError):
+            except (OSError, ValueError):   # 该内存段不可读（已 unmap 或受保护），跳过
                 continue
             if not data:
                 continue
@@ -134,7 +134,7 @@ def find_pid(pattern: str = "opt/wechat/wechat") -> int:
             continue
         try:
             cmd = (d / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
-        except OSError:
+        except OSError:        # 读 /proc 条目失败：进程可能在扫描期间退出，跳过
             continue
         if pattern in cmd and "crashpad" not in cmd:
             return int(d.name)
