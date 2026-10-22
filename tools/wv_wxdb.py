@@ -216,10 +216,15 @@ SALT_SZ = 16
 
 
 def derive_keys(enc_key: bytes, salt: bytes) -> tuple[bytes, bytes]:
-    """返回 (aes_key, mac_key)"""
+    """按 SQLCipher 4 规范派生 (aes_key, mac_key)。
+
+    规范：加密 key 用原始 salt，MAC key 用 salt ^ 0x3a。
+    早期版本把两者写反了 —— salt 与 enc_key 都对，但 AES 解出来是随机字节，
+    表现为「文件头能对上、sqlite3 却说 file is not a database」。
+    """
     mac_salt = bytes(b ^ 0x3A for b in salt)
-    aes_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, KDF_ITER, dklen=KEY_SZ)
-    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, salt, KDF_ITER, dklen=KEY_SZ)
+    aes_key = hashlib.pbkdf2_hmac("sha512", enc_key, salt, KDF_ITER, dklen=KEY_SZ)
+    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, KDF_ITER, dklen=KEY_SZ)
     return aes_key, mac_key
 
 
@@ -270,6 +275,9 @@ def decrypt_db(enc_key: bytes, src: Path, dst: Path) -> bool:
             pt = _aes_cbc_decrypt(aes_key, iv, ct)
             out += b"SQLite format 3\x00"
             out += pt
+            # 必须补满 reserve，否则 page1 只有 4048 字节、后续页全部错位，
+            # 文件头虽是 "SQLite format 3" 但 sqlite3 会报 file is not a database
+            out += b"\x00" * RESERVE
         else:
             ct = page[:PAGE_SZ - RESERVE]
             iv = struct.pack(">I", pi + 1) + b"\x00" * 12
