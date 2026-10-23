@@ -116,14 +116,6 @@ COPY deploy/wv-freeze-runtime /custom-cont-init.d/02-wv-freeze
 RUN chmod 755 /custom-cont-init.d/02-wv-freeze
 
 # ---------------------------------------------------------------------------
-# 6.1) 自动同步服务（s6）：监视微信消息库变化 → 解密入库 → 媒体关联 → 重载
-#      注册为 s6 longrun，随容器启动、崩溃自拉起，不依赖桌面会话存活。
-# ---------------------------------------------------------------------------
-COPY deploy/s6/svc-autosync /etc/s6-overlay/s6-rc.d/svc-autosync
-RUN chmod 755 /etc/s6-overlay/s6-rc.d/svc-autosync/run \
- && touch /etc/s6-overlay/s6-rc.d/user/contents.d/svc-autosync
-
-# ---------------------------------------------------------------------------
 # 7) 权限与用户
 #    容器内桌面进程以 abc（linuxserver base 默认用户，uid 911）运行；
 #    数据卷 /data 需可写。方舟服务也以该用户运行。
@@ -155,3 +147,16 @@ RUN apt-get update \
 # KasmVNC web 客户端端口（3000 HTTP / 3001 HTTPS）
 # 方舟 Web 界面端口 8790
 EXPOSE 8790 3000 3001
+
+# ---------------------------------------------------------------------------
+# 9) 自动同步服务（s6）：监视微信消息库变化 → 解密入库 → 媒体关联 → 重载
+#    注册为 s6 longrun，随容器启动、崩溃自拉起，不依赖桌面会话存活。
+#
+#    ⚠️ 必须放在 Dockerfile 最末尾：它只 COPY 一个几 KB 的 shell 脚本，
+#    放在中间会让紧随其后的大层（apt 装 sqlcipher/gdb/ffmpeg ≈ 数百 MB）
+#    缓存全部失效，任何 s6 微调都要重跑十几分钟的 apt。
+#    放末尾则前面的重层全部命中缓存，重建只需秒级。
+# ---------------------------------------------------------------------------
+COPY deploy/s6/svc-autosync /etc/s6-overlay/s6-rc.d/svc-autosync
+RUN chmod 755 /etc/s6-overlay/s6-rc.d/svc-autosync/run \
+ && touch /etc/s6-overlay/s6-rc.d/user/contents.d/svc-autosync

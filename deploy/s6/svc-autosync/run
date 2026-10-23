@@ -1,3 +1,37 @@
 #!/usr/bin/with-contenv bash
 # shellcheck shell=bash
-exec s6-setuidgid abc /opt/wx-venv/bin/python3 /app/archiver/wv_autosync.py
+#
+# 自动同步调度器（s6 longrun）
+#
+# /opt/wx-venv 不是镜像自带，而是启动钩子 02-wv-freeze 从数据卷
+# /data/wx_backup/frozen/wx-venv 软链出来的运行时资产。
+# 数据卷未固化时（首次部署 / 数据卷被清空 / 从别处拷来的空卷）它不存在，
+# 此时直接 exec 会以 127 退出，s6 会按 100ms 级别反复重启，
+# 把日志刷成 replay 风暴、空耗 CPU，还掩盖真正的原因。
+#
+# 所以这里把等待放进脚本内部：s6 始终看到「服务在跑」，
+# 运行时一出现就自动接上，无需人工重启容器。
+
+PY=/opt/wx-venv/bin/python3
+APP=/app/archiver/wv_autosync.py
+WAITED=
+
+while [ ! -x "$PY" ]; do
+    if [ -z "$WAITED" ]; then
+        echo "[autosync] 运行时缺失：$PY 不存在，等待数据卷固化（每 60s 重试，不退出）" >&2
+        echo "[autosync] 提示：若长期停留在此，说明 /data/wx_backup/frozen/wx-venv 没有就位。" >&2
+        WAITED=1
+    fi
+    sleep 60
+done
+
+if [ -n "$WAITED" ]; then
+    echo "[autosync] 运行时就绪，启动调度器" >&2
+fi
+
+if [ ! -f "$APP" ]; then
+    echo "[autosync] 调度器脚本缺失：$APP" >&2
+    exit 1
+fi
+
+exec s6-setuidgid abc "$PY" "$APP"
