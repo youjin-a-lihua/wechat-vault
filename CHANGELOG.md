@@ -6,6 +6,14 @@
 ## [Unreleased]
 
 ### 新增
+- **自动同步（`archiver/wv_autosync.py`）**：常驻进程监视微信消息库的
+  `(大小, mtime)` 指纹，变化即自动完成「解密 → 入库 → 媒体关联 → 查看器重载」。
+  默认轮询 60s、写入稳定判定 30s，避免读到写了一半的库。
+  以 s6 longrun 注册（`svc-autosync`），随容器启动、崩溃自拉起，不依赖桌面会话。
+  实测一次完整同步 37s。
+  - `WV_AUTOSYNC=0` 关闭；`WV_AUTOSYNC_POLL` / `WV_AUTOSYNC_STABLE` 调整节奏
+  - 状态存 `/data/logs/autosync.state`（重启后不重复跑已同步过的数据）
+  - 日志 `/data/logs/autosync.log`；失败后 `WV_AUTOSYNC_RETRY`（默认 300s）重试
 - **从微信客户端直接同步**：`archiver/wv_sync.py story` 一键完成
   「解密数据库 → 读消息写 vault.db → 供查看器展示」。
   微信登录后不必再手工导出，直接从本地加密库取数据。
@@ -14,9 +22,9 @@
   回退到 `all_keys.json` 的 enc_key 快照。
 - **`tools/wv_keymem.py`**：基于 salt 锚点在微信进程内存里定位密钥，
   供密钥快照失效时重新提取。
-- **自动解析：检测到新文件即触发**。调度器每 `WV_AUTO_SCAN_MIN` 分钟（默认 5）
-  用 `find -L` 检查投放目录，有变更就走完整链路（文字 → 存档轨 → 媒体 → 重载）。
-  可用 `WV_AUTO_SCAN_MIN=0` 关闭。
+- **收件箱变更检测**：投放目录有新增文件时，走完整链路
+  （文字 → 存档轨 → 媒体 → 重载）。与上面的「自动同步」互补：
+  前者针对微信客户端数据库，后者针对手工投放的文件。
 - **手动解析按钮**：归档面板改为「立即解析（含图片）」，`POST /api/ingest`
   补齐媒体链路（`wv_media.py all` + `extras`），不再只处理文字。
 - **解密增量缓存**：`<媒体目录>/_decode_cache.json` 记录每个 `.dat` 的
