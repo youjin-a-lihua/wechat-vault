@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### 工程
+- 代码注释全面补齐：为全部核心模块的公开函数与复杂逻辑补上
+  docstring 与关键行内说明（AST 扫描从 89 处缺失降到 1 处——
+  唯一剩余是镜像 Windows API 结构体的 `ctypes` 定义，无需注释）。
+  重点补足两个新模块（`wv_sync` / `wv_autosync`）的模块级设计说明，
+  以及 SQLCipher 4 页结构、消息表 md5 反查等算法层注释。
+
+---
+
+## [0.2.0] - 2026-10-23
+
 ### 新增
 - **自动同步（`archiver/wv_autosync.py`）**：常驻进程监视微信消息库的
   `(大小, mtime)` 指纹，变化即自动完成「解密 → 入库 → 媒体关联 → 查看器重载」。
@@ -81,6 +92,15 @@
 - 新增 `.gitattributes`：强制 `*.sh` / `*.py` / `*.yml` 使用 LF。
   `core.autocrlf=true` 时 Windows 克隆会把 `.sh` 转成 CRLF，
   在 Linux 上执行会报 `bad interpreter`。
+- **自动同步服务固化进镜像**：s6 服务定义（`deploy/s6/svc-autosync`）
+  由 `Dockerfile.single` 末尾 COPY 进镜像，容器重建后自动恢复，
+  不再依赖对运行中容器的手工修补。COPY 放在最末尾是为了不击穿
+  后面 `apt install sqlcipher/gdb/ffmpeg` 的数百 MB 缓存层——
+  镜像重建从十几分钟降到 50 秒。
+- **调度器启动自愈**：`/opt/wx-venv` 是启动钩子从数据卷软链出来的
+  运行时资产，数据卷未固化时并不存在；原 `run` 脚本直接 exec 会以
+  127 退出，s6 以 100ms 级反复重启形成日志风暴。改为脚本内等待
+  （60s 重试、不退出），运行时一出现自动接上，无需人工干预。
 - 补充两处静默 `except` 的日志：改为「计数 + 只记前 5 条 + 结尾汇总」，
   避免百万级循环刷屏，同时不再吞掉异常。
 - `tests/_nas_*.py` 等含真实部署路径的私有脚本移出版本控制并加入 `.gitignore`。

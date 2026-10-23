@@ -117,6 +117,7 @@ AUTH_FILE = Path(
 )
 
 def _load_file_auth() -> dict:
+    """读 auth.json（Web 设置页写入的密码哈希等）；损坏时忽略并告警。"""
     if AUTH_FILE.exists():
         try:
             return json.loads(AUTH_FILE.read_text(encoding="utf-8"))
@@ -162,6 +163,7 @@ PUBLIC_PATHS = {
 }
 
 def _client_ip(req: Request) -> str:
+    """客户端 IP（本服务直接暴露在局域网，无反向代理，取连接对端即可）。"""
     return (req.client.host if req.client else "") or ""
 
 @app.middleware("http")
@@ -208,6 +210,7 @@ async def _auth_guard(req: Request, call_next):
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
+    """登录页。"""
     f = STATIC_DIR / "login.html"
     if not f.exists():
         raise HTTPException(500, "登录页缺失")
@@ -215,6 +218,7 @@ def login_page():
 
 @app.get("/login.css")
 def login_css():
+    """登录页样式。"""
     f = STATIC_DIR / "login.css"
     if not f.exists():
         raise HTTPException(404, "not found")
@@ -259,6 +263,7 @@ async def api_login(req: Request):
 
 @app.post("/api/logout")
 def api_logout():
+    """退出登录：清掉会话 Cookie。"""
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(A.COOKIE_NAME, path="/")
     return resp
@@ -429,6 +434,7 @@ def load_data(data_dir: Path) -> dict:
             STATE["loading"] = False
 
 def _db() -> sqlite3.Connection:
+    """打开 vault.db 连接（每请求一连接，避免跨线程复用）；未加载回 503。"""
     path = STATE.get("index_path")
     if not path or not os.path.exists(path):
         raise HTTPException(503, "数据尚未加载")
@@ -492,6 +498,7 @@ def api_archive():
 
 @app.get("/api/status")
 def api_status():
+    """当前数据规模与加载状态（前端顶栏与启动自检用）。"""
     mode = STATE.get("mode", "scan")
     if mode == "store":
         msg_count = STATE.get("msg_count", 0)
@@ -535,6 +542,7 @@ def wechat_install(background: BackgroundTasks):
         return {"ok": True, "msg": "安装已在进行中"}
 
     def _run():
+        """后台任务：装完/超时后清掉 installing 标志，让按钮可再次点击。"""
         STATE["wechat_installing"] = True
         try:
             subprocess.run(["/bin/bash", WECHAT_CTL, "install"],
@@ -562,6 +570,7 @@ def _ensure_schema(db: Path) -> None:
     就能让服务起不来。真正的数据写入仍归归档器。
     """
     def cols(c, table: str) -> set[str]:
+        """某表现有列名（表不存在返回空集）。"""
         try:
             return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
         except sqlite3.Error:
@@ -663,6 +672,7 @@ def api_reload():
 # 投放口路径（供 /api/ingest 使用）：默认为归档库同级的 inbox，
 # 可用环境变量 WV_INBOX 覆盖。存档轨投放口为 inbox/raw。
 def _inbox_dir() -> Path:
+    """可读轨投放目录。"""
     env = os.environ.get("WV_INBOX")
     if env:
         return Path(env)
@@ -894,6 +904,7 @@ def api_search(
     lo, hi = _ts_bounds(date_from, date_to)
 
     def _conds(alias: str) -> tuple[str, list]:
+        """按给定表别名拼 WHERE 片段（msg 与 msg_fts 两处复用同一套过滤）。"""
         sql, params = "", []
         if conv_id:
             sql += f" AND {alias}conv_id=?"
@@ -1196,6 +1207,7 @@ def export_all(
         raise HTTPException(404, "没有可导出的会话")
 
     def _all():
+        """把首元素与生成器重新拼成一个流（先取 first 是为了判空 404）。"""
         yield first
         yield from it
 
@@ -1209,6 +1221,7 @@ def export_all(
                    "text/csv; charset=utf-8")
     if fmt == "txt":
         def _gen_txt():
+            """逐会话 yield 文本，会话之间加分隔线。"""
             first = True
             for c in convs:
                 if not first:
@@ -1223,6 +1236,7 @@ def export_all(
     mroot = _media_root()
 
     def _gen_html():
+        """逐会话 yield HTML 片段，拼成单文件（可整体打印为 PDF）。"""
         yield _HTML_HEAD + f"<title>微信聊天记录 · {tag}</title>" \
                            f"<style>{X._CSS}</style></head><body>"
         first = True
@@ -1313,6 +1327,7 @@ def _merge_html(parts: list[str], title: str) -> str:
     )
 
 def _media_root() -> Path | None:
+    """媒体根目录：优先 WV_MEDIA，其次归档库同级 media/。"""
     store = STATE.get("data_dir")
     env = os.environ.get("WV_MEDIA")
     root = Path(env) if env else (Path(store) / "media" if store else None)
@@ -1322,6 +1337,7 @@ def _media_root() -> Path | None:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    """主界面外壳。"""
     f = STATIC_DIR / "index.html"
     if not f.exists():
         raise HTTPException(500, "前端文件缺失")
@@ -1332,6 +1348,7 @@ def index():
 
 @app.get("/app.js")
 def appjs():
+    """主界面脚本。"""
     f = STATIC_DIR / "app.js"
     if not f.exists():
         raise HTTPException(500, "前端文件缺失")
@@ -1340,6 +1357,7 @@ def appjs():
 
 @app.get("/app.css")
 def appcss():
+    """主界面样式。"""
     f = STATIC_DIR / "app.css"
     if not f.exists():
         raise HTTPException(500, "前端文件缺失")
@@ -1350,6 +1368,7 @@ def appcss():
 
 @app.get("/sw.js")
 def service_worker():
+    """Service Worker（缓存策略在 sw.js 内定义）。"""
     f = STATIC_DIR / "sw.js"
     if not f.exists():
         raise HTTPException(404, "not found")
@@ -1359,6 +1378,7 @@ def service_worker():
 
 @app.get("/manifest.webmanifest")
 def manifest():
+    """PWA 清单。"""
     f = STATIC_DIR / "manifest.webmanifest"
     if not f.exists():
         raise HTTPException(404, "not found")
@@ -1366,6 +1386,7 @@ def manifest():
 
 @app.get("/icon.svg")
 def icon():
+    """应用图标。"""
     f = STATIC_DIR / "icon.svg"
     if not f.exists():
         raise HTTPException(404, "not found")
@@ -1373,6 +1394,7 @@ def icon():
 
 @app.get("/favicon.ico")
 def favicon():
+    """站点图标（直接复用 SVG 图标，现代浏览器都认）。"""
     # 复用 SVG 图标（现代浏览器都认）
     f = STATIC_DIR / "icon.svg"
     if not f.exists():
@@ -1458,6 +1480,7 @@ def media(rel: str):
 # 入口
 
 def main():
+    """CLI 入口：--store 直读 vault.db（生产），--data 临时解析目录。"""
     ap = argparse.ArgumentParser(description="WeChat Vault 查看器")
     ap.add_argument("--data", help="聊天记录目录（临时模式：启动时解析并建索引）")
     ap.add_argument("--store", help="归档库目录（生产模式：直接读 vault.db，秒级启动）")

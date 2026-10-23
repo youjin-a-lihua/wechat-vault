@@ -171,6 +171,7 @@ def ingest(source_root: Path | None = None, out_dir: Path | None = None,
 # CLI
 # ──────────────────────────────────────────────────────────────────
 def main() -> int:
+    """CLI 入口：accounts = 列账号，ingest = 导出为标准中间格式。"""
     ap = argparse.ArgumentParser(description="微信数据源适配器（单容器一体化）")
     sub = ap.add_subparsers(dest="cmd")
 

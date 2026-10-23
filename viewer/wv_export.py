@@ -38,6 +38,7 @@ TYPE_LABEL = {
 }
 
 def _fmt_time(ts) -> str:
+    """Unix 秒 → `YYYY-MM-DD HH:MM:SS`；非法值给空串。"""
     if not ts:
         return ""
     try:
@@ -46,6 +47,7 @@ def _fmt_time(ts) -> str:
         return ""
 
 def _fmt_day(ts) -> str:
+    """Unix 秒 → `YYYY年MM月DD日`（TXT 导出的日期分隔线用）。"""
     if not ts:
         return ""
     try:
@@ -103,6 +105,7 @@ def convs_to_csv(convs: list[dict]) -> bytes:
 # TXT
 
 def conv_to_txt(conv: dict) -> bytes:
+    """单会话 → 纯文本流水（按日分隔，最通用的交换格式）。"""
     title = conv.get("title") or conv.get("conv_id") or "会话"
     acct = conv.get("account") or "默认账号"
     lines = [
@@ -198,16 +201,23 @@ _AV_COLORS = ['#5b8ff9', '#61ddaa', '#65789b', '#f6bd16', '#7262fd',
               '#78d3f8', '#9661bc', '#f6903d', '#008685', '#f08bb4']
 
 def _av_color(name: str) -> str:
+    """名字 → 稳定头像色块（同一人永远同色，哈希取模）。"""
     h = 0
     for ch in str(name):
         h = (h * 31 + ord(ch)) & 0xFFFFFFFF
     return _AV_COLORS[h % len(_AV_COLORS)]
 
 def _initial(name: str) -> str:
+    """头像色块上显示的首字符。"""
     s = str(name or "?").strip()
     return s[0].upper() if s else "?"
 
 def _media_html(m: dict, inline_media: bool, media_root: Path | None) -> str:
+    """媒体 → 对应的 HTML 标签（img/audio/video/a）；无媒体给空串。
+
+    inline_media=True 时把文件读成 data URI 嵌进导出文件（彻底离线，
+    代价是体积），路径越界（逃出 media_root）时拒绝内联。
+    """
     rel = (m.get("media") or "").strip()
     if not rel:
         return ""

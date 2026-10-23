@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""从微信客户端数据库同步消息到 vault.db。"""
+"""从微信客户端数据库直接同步消息到 vault.db（自动同步链路的第二步）。
+
+微信 4.x 登录后，消息以 SQLCipher 4 加密库落在
+`xwechat_files/<wxid>/db_storage/message/message_*.db`。本模块：
+
+  1. 解密 —— 优先用账号级 passphrase（passphrase.json）逐库派生密钥，
+     库被微信重建后依然能解；否则回退到 all_keys.json 的 enc_key 快照
+  2. 入库 —— 逐库读 Msg_* 表，转成 vault.db 的 conv/msg 通用结构
+
+与 `wv_woc.py`（吃迁移备份包）互补：本模块吃的是客户端正在用的「活库」，
+配合 `wv_autosync.py` 的指纹监视，即构成「微信一有新消息就自动入库」。
+"""
 from __future__ import annotations
 
 import argparse
@@ -41,6 +52,7 @@ BASE_TYPE = {
     43: "video", 47: "emoji", 48: "location", 49: "link",
     50: "call", 10000: "system", 10002: "revoke",
 }
+# local_type 高位是 WCDB 标志位，取低 32 位才是微信定义的消息类型
 
 def load_keys(keys_path: Path) -> dict:
     """读取 all_keys.json，返回 {相对路径: (enc_key_hex, salt_hex)}。"""
@@ -112,6 +124,10 @@ def decrypt_one(src: Path, dst: Path, enc_key: str, salt: str = "",
         aes_key = bytes.fromhex(key_hex)
 
     out = bytearray()
+    # SQLCipher 4 页结构（4096B/页，reserve 80B）：
+    #   页 0   [0:16) 盐（参与密钥派生） | [16:4016) 密文
+    #   页 n>0 [0:4016) 密文 | [4016:4032) IV | [4032:4096) 页 HMAC
+    # 每页独立 CBC，IV 就在页尾；reserve 区不参与解密，原位补零即可。
     n_pages = len(blob) // _PAGE_SZ
     for pi in range(n_pages):
         page = blob[pi * _PAGE_SZ:(pi + 1) * _PAGE_SZ]
@@ -119,6 +135,7 @@ def decrypt_one(src: Path, dst: Path, enc_key: str, salt: str = "",
         if pi == 0:
             ct = page[_SALT_SZ:_IV_OFF]
             pt = _AES.new(aes_key, _AES.MODE_CBC, iv).decrypt(ct)
+            # 明文页 0 要还原 SQLite 头（加密状态下被盐占据）
             out += b"SQLite format 3\x00" + pt + b"\x00" * _RESERVE
         else:
             ct = page[:_IV_OFF]
@@ -147,6 +164,7 @@ def decrypt_all(account: Path, plain_out: Path, keys: dict,
     return ok
 
 def _ro(p: Path) -> sqlite3.Connection:
+    """只读模式打开 SQLite，避免干扰微信正在写的库。"""
     return sqlite3.connect("file:%s?mode=ro" % p, uri=True)
 
 def read_contacts(plain: Path) -> dict[int, dict]:
@@ -297,6 +315,8 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             c.close()
             continue
         for t in tabs:
+            # 表名 = "Msg_" + md5(username)，只能拿 session.db 的 username
+            # 列表逐个算 md5 反查出会话归属
             h = t[4:]
             username = next((u for u in sessions if hashlib.md5(u.encode()).hexdigest() == h), "")
             if not username:
@@ -372,6 +392,7 @@ def _display_title(username: str, contacts: dict[int, dict], sessions: dict[str,
     return sessions.get(username, username)
 
 def main() -> int:
+    """CLI 入口：story = 解密 + 入库，decrypt = 只解密不入库。"""
     ap = argparse.ArgumentParser(description="从微信客户端数据库同步消息到 vault.db")
     ap.add_argument("cmd", nargs="?", default="story",
                     choices=["story", "decrypt"], help="story=解密+入库, decrypt=仅解密")

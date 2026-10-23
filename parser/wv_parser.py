@@ -195,6 +195,7 @@ def parse_time(value: Any) -> tuple[int | None, str | None]:
     return None, raw
 
 def fmt_time(ts: int | None) -> str:
+    """Unix 秒 → `YYYY-MM-DD HH:MM:SS`（固定东八区）。"""
     if not ts:
         return ""
     return datetime.fromtimestamp(ts, CST).strftime("%Y-%m-%d %H:%M:%S")
@@ -511,6 +512,7 @@ def parse_txt_text(text: str) -> list[dict]:
             title_hint = _first.strip()
 
     def flush():
+        """把当前累积的多行消息落行：正文 = 各行 clean 后拼接。"""
         nonlocal cur
         if cur:
             cur["content"] = clean_text("\n".join(cur.pop("_buf", [])))
