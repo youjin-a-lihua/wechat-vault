@@ -287,6 +287,7 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 def now_ts() -> int:
+    """当前 Unix 秒（统一时间戳口径）。"""
     return int(time.time())
 
 def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
@@ -301,6 +302,7 @@ def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 def _existing_tables(conn: sqlite3.Connection) -> set[str]:
+    """当前库里已有的表名集合（schema 迁移的判断依据）。"""
     return {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -316,12 +318,14 @@ def migrate_schema(conn: sqlite3.Connection, verbose: bool = False) -> list[str]
     tables = _existing_tables(conn)
 
     def cols(table: str) -> set[str]:
+        """某表现有列名（表不存在返回空集）。"""
         try:
             return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         except sqlite3.Error:
             return set()
 
     def add_col(table: str, col: str, decl: str) -> None:
+        """给已存在的表补一列（幂等：已存在则跳过）。"""
         if table in tables and col not in cols(table):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             changes.append(f"{table}.{col}")
@@ -795,6 +799,7 @@ def archive_move(source_dir: Path, dest_dir: Path, after_days: int = 7,
 # 统计
 
 def show_stats(conn: sqlite3.Connection) -> None:
+    """打印归档库统计（规模 / 账号分布 / 类型分布 / 会话排行）。"""
     total = conn.execute("SELECT COUNT(*) FROM msg").fetchone()[0]
     if not total:
         print("归档库为空")
@@ -863,6 +868,7 @@ def _setup_logging() -> None:
     )
 
 def main():
+    """CLI 入口：scan = 增量导入，stats = 统计，其余子命令见 --help。"""
     _setup_logging()
     ap = argparse.ArgumentParser(description="WeChat Vault 归档器")
     sub = ap.add_subparsers(dest="cmd", required=True)

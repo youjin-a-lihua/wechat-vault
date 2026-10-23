@@ -67,6 +67,7 @@ TIMEOUT = int(os.environ.get("WV_FFMPEG_TIMEOUT", "90"))
 # ffmpeg
 
 def _ff(args: list[str], stdin: bytes, timeout: int = TIMEOUT):
+    """跑一次 ffmpeg：码流走 stdin、图片走 stdout，返回 (rc, out, err)。"""
     try:
         r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", *args],
                            input=stdin, capture_output=True, timeout=timeout)
@@ -77,6 +78,7 @@ def _ff(args: list[str], stdin: bytes, timeout: int = TIMEOUT):
         return -1, b"", "ffmpeg not found（镜像需安装 ffmpeg）"
 
 def _is_image(b: bytes) -> str | None:
+    """按 magic 判断解码产物是不是完整图片，返回扩展名或 None。"""
     if len(b) < 64:
         return None
     if b[:3] == b"\xff\xd8\xff":
@@ -88,6 +90,7 @@ def _is_image(b: bytes) -> str | None:
     return None
 
 def _try(payload: bytes, args: list[str]) -> bytes | None:
+    """尝试一种 ffmpeg 参数组合，产物必须是合法图片才算成功。"""
     rc, out, _ = _ff(args, payload)
     return out if rc == 0 and _is_image(out) else None
 
@@ -133,6 +136,7 @@ def decode_wxgf(data: bytes) -> dict:
 # V2 解密
 
 def xor_table(k: int) -> bytes:
+    """单字节 XOR → bytes.maketrans 转换表（比逐字节循环快一个量级）。"""
     return bytes.maketrans(bytes(range(256)), bytes(b ^ k for b in range(256)))
 
 def v2_strip(blob: bytes, aes_key: bytes, xor_key: int) -> bytes | None:
@@ -156,6 +160,7 @@ def v2_strip(blob: bytes, aes_key: bytes, xor_key: int) -> bytes | None:
 # CLI
 
 def _load_keys(out_dir: str) -> tuple[bytes, int]:
+    """读 wv_media 落盘的定标结果 _keys.json。"""
     k = json.load(open(os.path.join(out_dir, "_keys.json")))
     return k["aes_key"].encode(), int(k["xor_key"])
 
@@ -171,6 +176,7 @@ def _dims(jpeg: bytes) -> str:
         return ""
 
 def cmd_probe(a):
+    """抽样试解码：随机取 N 个 wxgf 验证 ffmpeg 链路与统计回退路径分布。"""
     aes_key, xor_key = _load_keys(a.out)
     files = glob.glob(a.attach.rstrip("/") + "/*/*/Img/*.dat")
     random.seed(7)
@@ -200,6 +206,7 @@ def cmd_probe(a):
     print("\n统计：", dict(stat))
 
 def cmd_decode(a):
+    """全量解码（复用 wv_media.run_wxam 的关联逻辑）。"""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import wv_media as M
     root = a.account_root or os.path.dirname(os.path.dirname(a.attach.rstrip("/")))
@@ -207,6 +214,7 @@ def cmd_decode(a):
                      ensure_ascii=False, indent=2))
 
 def main():
+    """CLI 入口：probe = 抽样验证，decode = 全量解码入库。"""
     ap = argparse.ArgumentParser(description="WxAM(wxgf) 原图解码（ffmpeg / HEVC）")
     ap.add_argument("cmd", choices=["probe", "decode"])
     ap.add_argument("--attach", default="", help="attach 目录")

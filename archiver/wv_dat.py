@@ -172,14 +172,17 @@ def _bmp_strong(buf: bytes) -> bool:
             and bpp in (1, 4, 8, 16, 24, 32))
 
 def _jpg_strong(buf: bytes) -> bool:
+    """JPEG 强校验：SOI 开头 + EOI 结尾。"""
     return (len(buf) > 4 and buf[:2] == b"\xff\xd8" and buf[-2:] == b"\xff\xd9")
 
 def _png_strong(buf: bytes) -> bool:
+    """PNG 强校验：完整签名 + IHDR + IEND。"""
     return (buf.startswith(b"\x89PNG\r\n\x1a\n")
             and b"IHDR" in buf[:32]
             and buf[-8:-4] == b"IEND")
 
 def _gif_strong(buf: bytes) -> bool:
+    """GIF 强校验：合法版本号 + 结束字节。"""
     return buf[:6] in (b"GIF87a", b"GIF89a") and buf[-1:] == b"\x3b"
 
 _STRONG = {
@@ -320,11 +323,15 @@ _INV_SBOX = bytes(_INV_SBOX)
 
 _RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36]
 
+# ── 纯 Python AES-128 逆变换（解密用；GF(2^8) 上的运算）──
+
 def _xtime(a: int) -> int:
+    """GF(2^8) 上乘 2（多项式模 x^8+x^4+x^3+x+1）。"""
     a <<= 1
     return (a ^ 0x1B) & 0xFF if a & 0x100 else a
 
 def _mul(a: int, b: int) -> int:
+    """GF(2^8) 通用乘法（俄罗斯农民乘法 + 逐次 xtime）。"""
     r = 0
     for _ in range(8):
         if b & 1:
@@ -353,10 +360,12 @@ def _expand_key(key: bytes) -> list[list[int]]:
     return [sum(w[r * 4:r * 4 + 4], []) for r in range(11)]
 
 def _add_round_key(state: list[int], rk: list[int]) -> None:
+    """轮密钥异加（AddRoundKey）。"""
     for i in range(16):
         state[i] ^= rk[i]
 
 def _inv_shift_rows(s: list[int]) -> None:
+    """逆行移位（InvShiftRows）：第 r 行循环右移 r 位。"""
     # 状态按列主序：s[c*4+r]
     for r in range(1, 4):
         row = [s[c * 4 + r] for c in range(4)]
@@ -365,10 +374,12 @@ def _inv_shift_rows(s: list[int]) -> None:
             s[c * 4 + r] = row[c]
 
 def _inv_sub_bytes(s: list[int]) -> None:
+    """逆字节替换（InvSubBytes）。"""
     for i in range(16):
         s[i] = _INV_SBOX[s[i]]
 
 def _inv_mix_columns(s: list[int]) -> None:
+    """逆列混合（InvMixColumns）：固定矩阵 {14,11,13,9} 乘每列。"""
     for c in range(4):
         a = s[c * 4:c * 4 + 4]
         s[c * 4 + 0] = _mul(a[0], 14) ^ _mul(a[1], 11) ^ _mul(a[2], 13) ^ _mul(a[3], 9)
@@ -751,6 +762,7 @@ def extract_v2_key(pid: int | None = None) -> bytes | None:
 # CLI
 
 def main():
+    """CLI 入口：decode / one / probe / extract-key / selftest。"""
     ap = argparse.ArgumentParser(description="微信 .dat 附件解码器")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

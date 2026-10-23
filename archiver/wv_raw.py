@@ -62,6 +62,7 @@ RAW_NAME_PREFIXES = ("bak_",)
 _SKIP_PREFIX = (".", "~$", "_")
 
 def now_ts() -> int:
+    """当前 Unix 秒。"""
     return int(time.time())
 
 def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
@@ -90,6 +91,7 @@ def _is_raw_candidate(p: Path) -> bool:
     return p.suffix.lower() in RAW_EXTS
 
 def _load_index(dest: Path) -> dict:
+    """读存档索引；损坏时按空索引继续（本代快照暂不可见，不丢数据）。"""
     idx = dest / "archive-index.json"
     if idx.is_file():
         try:
@@ -100,6 +102,7 @@ def _load_index(dest: Path) -> dict:
     return {"version": "1.0", "generations": [], "files": []}
 
 def _save_index(dest: Path, data: dict) -> Path:
+    """写存档索引（覆盖式；文件很小，无需原子化）。"""
     data["updated_at"] = datetime.now(CST).isoformat()
     out = dest / "archive-index.json"
     out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -269,6 +272,7 @@ def verify(dest: Path, verbose: bool = True) -> dict:
     return {"ok": ok, "missing": miss, "changed": bad, "problems": problems}
 
 def main() -> int:
+    """CLI 入口：ingest = 分代存档，list / verify = 查看与校验。"""
     ap = argparse.ArgumentParser(description="WeChat Vault 存档轨归档器（双轨制）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

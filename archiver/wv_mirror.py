@@ -121,6 +121,7 @@ def mirror(src: Path, dst: Path, delete: bool = True, verbose: bool = True,
 
 
 def main() -> int:
+    """CLI 入口：把热数据目录增量镜像到冷存储。"""
     ap = argparse.ArgumentParser(description="WeChat Vault 冷备镜像")
     ap.add_argument("--src", required=True, help="热数据目录")
     ap.add_argument("--dst", required=True, help="冷存储目录")

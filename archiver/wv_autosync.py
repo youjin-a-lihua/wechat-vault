@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""监视微信数据库变化并自动同步到方舟。"""
+"""监视微信数据库变化并自动同步到方舟。
+
+常驻进程（s6 longrun `svc-autosync`，随容器启动、崩溃自拉起）：
+每隔 POLL_SEC 对微信消息库取一次 (文件名, 大小, mtime) 指纹，发现变化后
+「等 STABLE_SEC 确认微信写完 → wv_sync 解密入库 → wv_media 关联媒体
+→ POST /api/reload 让查看器热加载」。
+
+设计约束：
+  - 单实例：锁文件 /tmp/wv_autosync.lock，崩溃残留自动接管
+  - 幂等：指纹持久化在 autosync.state，重启后不重复同步旧数据
+  - 失败退避：一轮失败后 RETRY_SEC 内不再尝试，避免日志风暴
+"""
 from __future__ import annotations
 
 import json
@@ -17,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """读环境变量为 int；非法值回退默认，结果不低于 minimum。"""
     try:
         return max(minimum, int(os.environ.get(name, default)))
     except ValueError:
@@ -81,6 +93,7 @@ def fingerprint(files: list[Path]) -> str:
 
 
 def read_state() -> dict:
+    """读上次同步的指纹；文件不存在或损坏都视为从未同步过。"""
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -88,6 +101,7 @@ def read_state() -> dict:
 
 
 def write_state(data: dict) -> None:
+    """原子写状态：先写 .tmp 再 replace，防止留下半截 JSON。"""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -113,6 +127,7 @@ def acquire_lock() -> bool:
 
 
 def release_lock() -> None:
+    """删除自己持有的锁；锁属于别的进程时不动它。"""
     try:
         if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
             LOCK_FILE.unlink()
@@ -121,6 +136,7 @@ def release_lock() -> None:
 
 
 def _run(cmd: list[str], timeout: int) -> tuple[bool, str]:
+    """跑子进程并取 stdout/stderr 尾部各三行拼成一行摘要。"""
     log.info("执行：%s", " ".join(cmd))
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -138,6 +154,7 @@ def _run(cmd: list[str], timeout: int) -> tuple[bool, str]:
 
 
 def sync_messages() -> tuple[bool, str]:
+    """解密 + 消息入库，实际执行 wv_sync.py story。"""
     return _run([PYTHON, str(HERE / "wv_sync.py"), "story",
                  "--wechat-files", str(WECHAT_FILES),
                  "--keys", str(KEYS),
@@ -146,6 +163,7 @@ def sync_messages() -> tuple[bool, str]:
 
 
 def sync_media() -> tuple[bool, str]:
+    """逐账号跑媒体关联（wv_media.py all）；单账号失败不中断其余。"""
     media = HERE / "wv_media.py"
     if not media.is_file():
         return True, "无媒体脚本，跳过"
@@ -183,6 +201,10 @@ def reload_viewer() -> tuple[bool, str]:
 
 
 def one_round() -> bool:
+    """完整一轮同步：消息失败即整轮失败；媒体/重载失败仅告警。
+
+    返回 True 才会推进指纹，失败时由主循环安排 RETRY_SEC 后重试。
+    """
     files = db_files()
     if not files:
         log.warning("未发现微信消息库：%s", WECHAT_FILES)
@@ -210,6 +232,7 @@ def one_round() -> bool:
 
 
 def main() -> int:
+    """日志双写（stdout + 文件）→ 开关检查 → 单实例锁 → 轮询主循环。"""
     level = os.environ.get("WV_AUTOSYNC_LOGLEVEL", "INFO").upper()
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     log_file = os.environ.get("WV_AUTOSYNC_LOG",

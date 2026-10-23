@@ -67,6 +67,7 @@ def verify_password(password: str, encoded: str) -> bool:
 # 会话令牌（无状态签名 Cookie）
 
 def _sign(secret: bytes, payload: str) -> str:
+    """HMAC-SHA256 签名 → URL 安全 base64（去 padding）。"""
     return base64.urlsafe_b64encode(
         hmac.new(secret, payload.encode("ascii"), hashlib.sha256).digest()
     ).decode("ascii").rstrip("=")
@@ -115,9 +116,11 @@ class LoginThrottle:
         return False, 0
 
     def record_fail(self, ip: str) -> None:
+        """记一次登录失败（窗口外的旧记录会被 is_locked 清掉）。"""
         self._fails.setdefault(ip, []).append(time.time())
 
     def reset(self, ip: str) -> None:
+        """登录成功后清空该 IP 的失败记录。"""
         self._fails.pop(ip, None)
 
 # 局域网网段白名单
@@ -164,6 +167,7 @@ def ip_in_any(ip: str, cidrs: Iterable[str]) -> bool:
     return any((v & mask) == net for net, mask in nets)
 
 def gen_secret() -> str:
+    """生成会话签名密钥（WV_SECRET；每个实例独立，泄漏即全员登出）。"""
     return secrets.token_urlsafe(32)
 
 # CLI：生成密码哈希

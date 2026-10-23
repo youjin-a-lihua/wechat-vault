@@ -95,9 +95,11 @@ def derive_xor_key(thumbs: list[str], sample: int = 120) -> int | None:
     return k if n >= max(3, len(thumbs[:sample]) // 4) else None
 
 def aes_key_of(code: int, wxid: str) -> bytes:
+    """V2 密钥派生：md5(f"{code}{wxid}") 前 16 字节即 AES-128 key。"""
     return hashlib.md5(("%d%s" % (code, wxid)).encode()).hexdigest()[:16].encode()
 
 def _strict_ok(block: bytes, key: bytes) -> bool:
+    """用「解密后必须以合法 JPEG 头开头」校验候选 key，过滤假阳性。"""
     try:
         pt = AES.new(key, AES.MODE_ECB).decrypt(block)
     except Exception:
@@ -107,6 +109,7 @@ def _strict_ok(block: bytes, key: bytes) -> bool:
 _SCAN: dict = {}
 
 def _scan_init(blocks: list[bytes], wxid: str):
+    """multiprocessing 池初始化：把扫描参数放进模块级全局（子进程继承）。"""
     _SCAN["blocks"], _SCAN["wxid"] = blocks, wxid
 
 def _scan_worker(rng: tuple[int, int]) -> int | None:
@@ -247,9 +250,11 @@ def decode_dat(blob: bytes, aes_key: bytes, xor_key: int) -> tuple[bytes, str] |
 _W = {}
 
 def _init_worker(aes_key: bytes, xor_key: int, out: str):
+    """解码池初始化：注入密钥与输出目录（子进程继承）。"""
     _W["aes"], _W["xor"], _W["out"] = aes_key, xor_key, out
 
 def _worker(path: str):
+    """单个 .dat 的解码落盘：内容 md5 作相对路径，天然去重。"""
     try:
         blob = open(path, "rb").read()
     except OSError:
@@ -490,6 +495,7 @@ def _plain_thumb_len(plain_dbs: str) -> dict[tuple, list[int]]:
     return _plain_media_meta(plain_dbs)[1]
 
 def _username_of(source_file: str | None) -> str:
+    """source_file（形如 /wxdb/<显示名>.json）→ 会话显示名。"""
     if not source_file:
         return ""
     return os.path.basename(str(source_file)).rsplit(".", 1)[0]
@@ -535,6 +541,7 @@ def run_link(vault: str, plain_dbs: str, idx: dict) -> dict:
     print("  明文库图片消息：%d 条" % len(psizes))
 
     def month_of(ts: int) -> str:
+        """消息时间 → 明文库分库月份（固定东八区，微信分库按本地时间）。"""
         return dt.datetime.fromtimestamp(
             ts, dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m")
 
@@ -638,6 +645,7 @@ def run_avatars(plain_dbs: str, out: str) -> dict:
 # CLI
 
 def main():
+    """CLI 入口：keys→decode→link→avatars→扩展媒体，`all` 串起完整流水线。"""
     _setup_logging()
     ap = argparse.ArgumentParser(description="微信数据方舟 · 媒体流水线")
     ap.add_argument("cmd", choices=["keys", "decode", "link", "avatars", "all", "videos", "files", "voice", "emoji", "wxam", "avatars-fetch", "extras"])
@@ -712,6 +720,7 @@ def main():
 #            判据 = (chat_name_id → Name2Id.user_name 的 hash, create_time)
 
 def _month8(ts: int) -> str:
+    """消息时间 → 微信分库月份（固定东八区）。"""
     return dt.datetime.fromtimestamp(
         ts, dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m")
 
@@ -904,6 +913,7 @@ def run_emoji(plain_dbs: str, vault: str, out: str,
     zb = zstd.ZstdDecompressor()
 
     def dec(b):
+        """消息体可能是 zstd 压缩的 BLOB，解压失败按原文处理。"""
         try:
             return zb.decompress(b)
         except Exception:
@@ -953,6 +963,7 @@ def run_emoji(plain_dbs: str, vault: str, out: str,
     print("  待下载 Top%d 表情" % len(top))
 
     def fetch(md5):
+        """下载单个表情：已有文件直接复用，按 magic 判扩展名落盘。"""
         for ext in (".gif", ".png", ".jpg", ".webp"):
             if os.path.exists(os.path.join(edir, md5 + ext)):
                 return (md5, md5 + ext)
@@ -1119,6 +1130,7 @@ def run_wxam(account_root: str, vault: str, out: str, workers: int = 3) -> dict:
 _WX: dict = {}
 
 def _wx_init(aes_key, xor_key, out):
+    """multiprocessing 池初始化：注入 V2 密钥与输出目录（子进程继承）。"""
     _WX.update(aes_key=aes_key, xor_key=xor_key, out=out)
 
 def _wx_worker(path):
