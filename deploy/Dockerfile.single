@@ -116,6 +116,14 @@ COPY deploy/wv-freeze-runtime /custom-cont-init.d/02-wv-freeze
 RUN chmod 755 /custom-cont-init.d/02-wv-freeze
 
 # ---------------------------------------------------------------------------
+# 6.1) 自动同步服务（s6）：监视微信消息库变化 → 解密入库 → 媒体关联 → 重载
+#      注册为 s6 longrun，随容器启动、崩溃自拉起，不依赖桌面会话存活。
+# ---------------------------------------------------------------------------
+COPY deploy/s6/svc-autosync /etc/s6-overlay/s6-rc.d/svc-autosync
+RUN chmod 755 /etc/s6-overlay/s6-rc.d/svc-autosync/run \
+ && touch /etc/s6-overlay/s6-rc.d/user/contents.d/svc-autosync
+
+# ---------------------------------------------------------------------------
 # 7) 权限与用户
 #    容器内桌面进程以 abc（linuxserver base 默认用户，uid 911）运行；
 #    数据卷 /data 需可写。方舟服务也以该用户运行。

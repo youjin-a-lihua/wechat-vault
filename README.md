@@ -54,7 +54,18 @@ sudo docker compose -f docker-compose.single.yml up -d
 
 ### 从微信客户端同步
 
-微信登录后，聊天记录存在本地加密数据库（SQLCipher 4）里，一步同步：
+微信登录后，聊天记录存在本地加密数据库（SQLCipher 4）里。
+
+**默认全自动**：容器内常驻 `svc-autosync` 服务，监视微信消息库的
+`(大小, mtime)` 指纹。一有新消息落盘，自动完成
+「解密 → 入库 → 媒体关联 → 查看器重载」，打开网页即可看到最新内容，无需手动操作。
+
+- 默认轮询 60s，检测到变化后再等 30s 确认写入完成（避免读到写了一半的库）
+- 状态存 `/data/logs/autosync.state`，重启后不重复跑已同步的数据
+- 日志：`/data/logs/autosync.log`
+- `WV_AUTOSYNC=0` 可关闭；`WV_AUTOSYNC_POLL` / `WV_AUTOSYNC_STABLE` 调整节奏
+
+**手动同步**（排查问题或立即触发）：
 
 ```bash
 docker exec wechat-vault /opt/wx-venv/bin/python3 /app/archiver/wv_sync.py story \

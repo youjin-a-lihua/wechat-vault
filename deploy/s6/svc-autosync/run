@@ -1,0 +1,3 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+exec s6-setuidgid abc /opt/wx-venv/bin/python3 /app/archiver/wv_autosync.py
