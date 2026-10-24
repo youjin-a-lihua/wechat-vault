@@ -46,7 +46,13 @@ import logging
 
 log = logging.getLogger(__name__)
 
-CST = timezone(timedelta(hours=8))
+# 时区偏移（小时）：默认东八区，海外部署用 WV_TZ_OFFSET 覆盖
+# （按日分代的目录名依赖它，配错会让快照日期整体偏移）
+try:
+    TZ_OFFSET = float(os.environ.get("WV_TZ_OFFSET", "8"))
+except ValueError:
+    TZ_OFFSET = 8.0
+CST = timezone(timedelta(hours=TZ_OFFSET))
 
 # 存档轨认的文件类型。注意：**不含** .txt/.csv/.json/.html ——
 # 那些是"可读轨"的输入，由 wv_archiver.py 处理，两者严格分工不重叠。

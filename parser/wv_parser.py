@@ -54,7 +54,13 @@ log = logging.getLogger(__name__)
 
 # 常量
 
-CST = timezone(timedelta(hours=8))  # 中国标准时间
+# 时区偏移（小时）：默认东八区，海外部署用 WV_TZ_OFFSET 覆盖。
+# 解析无时区的本地时间串时按它解释，配错会让所有消息时间整体偏移。
+try:
+    TZ_OFFSET = float(os.environ.get("WV_TZ_OFFSET", "8"))
+except ValueError:
+    TZ_OFFSET = 8.0
+CST = timezone(timedelta(hours=TZ_OFFSET))
 
 # 消息类型归一化映射（覆盖 WeChatMsg / PyWxDump / 官方导出的各种叫法）
 TYPE_MAP = {
