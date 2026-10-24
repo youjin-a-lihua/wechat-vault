@@ -57,9 +57,17 @@ STATIC_DIR = BASE_DIR / "static"
 # 多账号：直接躺在投放口根目录的文件归入此账号（与 archiver 约定一致）
 DEFAULT_ACCOUNT = "默认账号"
 
-# 聊天记录按东八区自然日切分（与前端 fmtDay 口径一致）
-TZ8 = dt.timezone(dt.timedelta(hours=8))
-DAY_EXPR = "date(ts, 'unixepoch', '+8 hours')"
+# 聊天记录按本地自然日切分（与前端 fmtDay 口径一致）。
+# 偏移可配：海外部署设 WV_TZ_OFFSET，SQL 里的日期表达式必须跟着一起变，
+# 否则「按日期查找」的边界会和实际展示差一整天。
+try:
+    TZ_OFFSET = float(os.environ.get("WV_TZ_OFFSET", "8"))
+except ValueError:
+    TZ_OFFSET = 8.0
+TZ8 = dt.timezone(dt.timedelta(hours=TZ_OFFSET))
+# SQLite 的时区修饰串，供所有 strftime/date 复用（避免各处再写一遍 %+g 格式化）
+TZ_SQL = "%+g hours" % TZ_OFFSET
+DAY_EXPR = "date(ts, 'unixepoch', '%s')" % TZ_SQL
 
 def _day_bounds(day: str) -> tuple[int, int]:
     """把 `YYYY-MM-DD`（东八区自然日）换算为 [lo, hi) 时间戳；非法输入返回 (0,0)。"""
@@ -588,6 +596,8 @@ def _ensure_schema(db: Path) -> None:
             ("conv", "account", "TEXT DEFAULT ''"),
             ("msg", "account", "TEXT DEFAULT ''"),
             ("msg", "media_full", "TEXT"),
+            # 显示名会重名（实测 199 组），头像必须靠 username 才能精确对上
+            ("msg", "sender_username", "TEXT DEFAULT ''"),
         ):
             if table in tables and col not in cols(c, table):
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -1087,7 +1097,7 @@ def api_stats(
             hour_conds.append("account=?")
             hour_params.append(account)
         hour_sql = (
-            "SELECT CAST(strftime('%H', ts, 'unixepoch', '+8 hours') AS INTEGER) h, "
+            "SELECT CAST(strftime('%H', ts, 'unixepoch', '" + TZ_SQL + "') AS INTEGER) h, "
             "COUNT(*) n FROM msg WHERE " + " AND ".join(hour_conds) +
             " GROUP BY h ORDER BY h"
         )

@@ -259,7 +259,12 @@ def _summarize(base: str, body: str) -> str:
     return body
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """确保 vault.db 有 conv/msg 表（与 wv_archiver 的 schema 一致）。"""
+    """确保 vault.db 有 conv/msg 表（与 wv_archiver 的 schema 一致）。
+
+    sender_username 是后加的：老库只有 sender（显示名），而显示名会重名
+    （实测 4933 个联系人里有 199 组同名），前端拿它查头像必然串。新库直接建出来，
+    老库由 migrate_schema 补列、由回填逻辑补数据。
+    """
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS conv (
         conv_id TEXT PRIMARY KEY, account TEXT DEFAULT '', title TEXT,
@@ -271,7 +276,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         msg_id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, account TEXT DEFAULT '',
         seq INTEGER, ts INTEGER, time_str TEXT, sender TEXT, is_self INTEGER DEFAULT 0,
         type TEXT, content TEXT, media TEXT, media_full TEXT,
-        source_file TEXT, created_at INTEGER
+        source_file TEXT, created_at INTEGER, sender_username TEXT DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts);
     CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg(ts);
@@ -279,6 +284,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_msg_account ON msg(account);
     CREATE INDEX IF NOT EXISTS idx_conv_account ON conv(account);
     """)
+    # 老库补列（CREATE TABLE IF NOT EXISTS 对已存在的表不生效）
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(msg)")}
+    if "sender_username" not in cols:
+        conn.execute("ALTER TABLE msg ADD COLUMN sender_username TEXT DEFAULT ''")
 
 def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                   since_ts: int = 0, limit_tables: int = 0,
@@ -294,7 +303,7 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
     ensure_schema(conn)
     conn.execute("PRAGMA journal_mode=WAL")
 
-    stats = {"conv": 0, "msg": 0, "skip_dup": 0, "tables": 0}
+    stats = {"conv": 0, "msg": 0, "skip_dup": 0, "tables": 0, "backfill": 0}
     msg_db = plain / "message"
     files = sorted(msg_db.glob("message_[0-9]*.db")) if msg_db.is_dir() else []
     if limit_tables:
@@ -340,29 +349,41 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                 is_self = 1 if sender_id in self_ids else 0
                 who = contacts.get(sender_id, {})
                 sender = who.get("remark") or who.get("nick") or who.get("username") or prefix or str(sender_id)
+                # 显示名不唯一（实测 199 组重名），头像必须靠 username 才能精确对上
+                sender_user = who.get("username") or ""
                 content_out = _summarize(base, body)
                 mid = MSG_PREFIX + hashlib.sha1(
                     ("%s|%s|%s" % (cid, local_id, ctime)).encode()).hexdigest()[:12]
                 batch.append((mid, cid, account_name, local_id, ctime,
                               time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ctime)),
                               sender, is_self, base, content_out,
-                              "/wxdb/%s" % ctitle, now))
+                              "/wxdb/%s" % ctitle, now, sender_user))
             if not batch:
                 continue
             fresh = []
+            backfill = []
             for b in batch:
-                dup = conn.execute(
-                    "SELECT 1 FROM msg WHERE conv_id=? AND ts=? AND content=? LIMIT 1",
+                row = conn.execute(
+                    "SELECT msg_id, sender_username FROM msg"
+                    " WHERE conv_id=? AND ts=? AND content=? LIMIT 1",
                     (b[1], b[4], b[9])).fetchone()
-                if dup:
+                if row:
                     stats["skip_dup"] += 1
+                    # 老库没有 sender_username，趁这一轮已经读到明文库把它补上；
+                    # 只补空值，不覆盖已有数据
+                    if b[12] and not (row[1] or ""):
+                        backfill.append((b[12], row[0]))
                 else:
-                    fresh.append(b[:10] + (None, None, b[10], b[11]))
+                    fresh.append(b[:10] + (None, None, b[10], b[11], b[12]))
+            if backfill:
+                conn.executemany(
+                    "UPDATE msg SET sender_username=? WHERE msg_id=?", backfill)
+                stats["backfill"] = stats.get("backfill", 0) + len(backfill)
             if fresh:
                 conn.executemany(
                     "INSERT OR IGNORE INTO msg (msg_id, conv_id, account, seq, ts, time_str,"
-                    " sender, is_self, type, content, media, media_full, source_file, created_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", fresh)
+                    " sender, is_self, type, content, media, media_full, source_file, created_at,"
+                    " sender_username) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", fresh)
                 stats["msg"] += len(fresh)
 
             ts_list = [b[4] for b in batch]
@@ -390,6 +411,36 @@ def _display_title(username: str, contacts: dict[int, dict], sessions: dict[str,
         if v["username"] == username:
             return v["remark"] or v["nick"] or username
     return sessions.get(username, username)
+
+def check_schema(plain: Path) -> tuple[bool, str]:
+    """抽检一个消息库，确认表结构与当前解析逻辑匹配。
+
+    微信大版本升级会改表名/列名，而原来的失败表现是「解密完成 0/24」
+    或整表静默跳过——用户完全看不出是版本不支持。这里在入库前先探一次，
+    把「你的客户端可能不兼容」直接说出来，而不是让人对着空结果猜。
+    """
+    msg_dir = plain / "message"
+    dbs = sorted(msg_dir.glob("message_[0-9]*.db")) if msg_dir.is_dir() else []
+    if not dbs:
+        return False, "明文库下没有 message_*.db：要么解密失败，要么微信改了目录结构"
+    conn = _ro(dbs[0])
+    try:
+        tabs = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg\\_%' ESCAPE '\\'")]
+        if not tabs:
+            return False, ("%s 里找不到 Msg_* 表：微信可能改了表命名（当前逻辑对应微信 4.x）"
+                           % dbs[0].name)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % tabs[0])}
+    finally:
+        conn.close()
+    missing = sorted({"local_id", "local_type", "create_time",
+                      "real_sender_id", "message_content"} - cols)
+    if missing:
+        return False, ("%s.%s 缺少列 %s：解析逻辑按微信 4.x 的 Msg 表写，"
+                       "你的客户端版本可能不兼容。提 issue 时请附上微信版本号"
+                       % (dbs[0].name, tabs[0], ", ".join(missing)))
+    return True, ""
+
 
 def main() -> int:
     """CLI 入口：story = 解密 + 入库，decrypt = 只解密不入库。"""
@@ -437,10 +488,15 @@ def main() -> int:
     if a.cmd == "decrypt":
         return 0
 
+    ok_schema, why = check_schema(plain)
+    if not ok_schema:
+        log.error("数据结构检查未通过 —— %s", why)
+        return 3
+
     stats = sync_messages(plain, Path(a.vault), DEFAULT_ACCOUNT, a.since, a.limit_tables,
                           self_wxid=account.name.split("_")[0])
-    log.info("同步完成：%d 个会话表 / 新增 %d 条消息 / 跳过重复 %d 条",
-             stats["tables"], stats["msg"], stats["skip_dup"])
+    log.info("同步完成：%d 个会话表 / 新增 %d 条消息 / 跳过重复 %d 条 / 补填发送者 %d 条",
+             stats["tables"], stats["msg"], stats["skip_dup"], stats["backfill"])
     return 0
 
 if __name__ == "__main__":
