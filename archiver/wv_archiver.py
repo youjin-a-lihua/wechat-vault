@@ -52,7 +52,13 @@ try:
 except Exception:  # pragma: no cover
     D = None
 
-CST = timezone(timedelta(hours=8))
+# 时区偏移（小时）：默认东八区。海外部署用 WV_TZ_OFFSET 改成自己的时区
+# （支持小数，如 5.5 / -3.5），否则按日期归档与消息时间展示会整体偏移。
+try:
+    TZ_OFFSET = float(os.environ.get("WV_TZ_OFFSET", "8"))
+except ValueError:
+    TZ_OFFSET = 8.0
+CST = timezone(timedelta(hours=TZ_OFFSET))
 SUPPORTED_EXT = {".csv", ".json", ".html", ".htm", ".txt"}
 
 #
@@ -256,7 +262,8 @@ CREATE TABLE IF NOT EXISTS msg (
     media       TEXT,            -- 展示用媒体相对路径（通常是缩略图）
     media_full  TEXT,            -- 原图相对路径（WxAM 解码产物；点开大图时用）
     source_file TEXT,
-    created_at  INTEGER
+    created_at  INTEGER,
+    sender_username TEXT DEFAULT ''  -- 发送者 username（显示名会重名，头像靠它精确匹配）
 );
 CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts);
 CREATE INDEX IF NOT EXISTS idx_msg_ts      ON msg(ts);
@@ -335,6 +342,7 @@ def migrate_schema(conn: sqlite3.Connection, verbose: bool = False) -> list[str]
     add_col("source_file", "n_added", "INTEGER DEFAULT 0")
     add_col("conv", "account", "TEXT DEFAULT ''")
     add_col("msg", "account", "TEXT DEFAULT ''")
+    add_col("msg", "sender_username", "TEXT DEFAULT ''")
 
     fts_cols = cols("msg_fts")
     if fts_cols and "account" not in fts_cols:

@@ -33,6 +33,7 @@ const state = {
   calFirst: '',
   calLast: '',
   calYM: '',
+  curConv: null,        // 当前会话的元信息快照（侧栏筛选后 state.convs 里可能找不到它）
 };
 
 /* ------------------------------ 工具 ------------------------------ */
@@ -101,14 +102,17 @@ function initial(name) {
 /* 头像：优先用微信头像（/api/avatar），拿不到就自动回退成稳定色块首字。
    实现要点：色块始终先渲染（含首字），头像图覆盖在其上；
    接口 404 时 onerror 直接移除 <img>，自然露出色块——无需额外请求编排。 */
-function avatarHTML(name, cls = 'avatar') {
+function avatarHTML(name, cls = 'avatar', avatarKey = '') {
   const n = String(name || '');
+  // 取图键与显示名分开：显示名用来渲染色块首字，username 用来精确取图。
+  // 显示名会重名（实测 4933 个联系人里 199 组同名），拿它取图必然串头像。
+  const key = String(avatarKey || n);
   // 自己这一侧用品牌绿（.me-avatar 渐变），不再走随机色
   const selfSide = cls.indexOf('me-avatar') >= 0;
   const bg = selfSide ? '' : ` style="background:${avatarColor(n)}"`;
   return `<div class="${cls}"${bg}>`
     + `<span class="av-fb">${esc(initial(n))}</span>`
-    + `<img class="av-img" src="/api/avatar?name=${encodeURIComponent(n)}"`
+    + `<img class="av-img" src="/api/avatar?name=${encodeURIComponent(key)}"`
     + ` alt="" loading="lazy" onerror="this.remove()">`
     + `</div>`;
 }
@@ -193,6 +197,7 @@ function closeAcctMenu() {
 
 function resetChat() {
   state.current = null;
+  state.curConv = null;
   state.msgLoaded = 0;
   state.msgTotal = 0;
   $('#chatHeader').style.display = 'none';
@@ -262,6 +267,7 @@ async function openConv(id) {
   state.current = id;
   const conv = state.convs.find(c => c.conv_id === id);
   if (!conv) return;
+  state.curConv = conv;
 
   $('#emptyState').style.display = 'none';
   $('#chatHeader').style.display = 'flex';
@@ -311,6 +317,13 @@ function renderMessages(msgs, mode = 'append') {
     const first = list.querySelector('.msg');
     if (first) { lastTs = Number(first.dataset.ts || 0); }
     lastDay = lastTs ? dayKey(lastTs) : null;
+  } else if (mode === 'append') {
+    // append 同理，以已有末条为基准，否则新消息前会再插一个同一天的日期分隔
+    const kids = list.children;
+    for (let i = kids.length - 1; i >= 0; i--) {
+      const ts = Number(kids[i].dataset.ts || 0);
+      if (ts) { lastTs = ts; lastDay = dayKey(ts); break; }
+    }
   }
 
   msgs.forEach(m => {
@@ -359,7 +372,8 @@ function buildMsg(m) {
   el.dataset.ts = m.ts || '';
   el.dataset.text = (m.content || '').toLowerCase();
 
-  const av = avatarHTML(m.sender, m.is_self ? 'avatar me-avatar' : 'avatar');
+  const av = avatarHTML(m.sender, m.is_self ? 'avatar me-avatar' : 'avatar',
+                        m.sender_username);
   const name = m.is_self ? '' : `<div class="sender-name">${esc(m.sender)}</div>`;
 
   let inner = '';
@@ -514,6 +528,204 @@ function onScroll() {
       break;
     }
   }
+}
+
+/* ------------------------------ 自动刷新 ------------------------------ */
+
+/* 后端每次 /api/reload 都会换一个 loaded_at，拿它 + msg_count 当"有没有新数据"的判据：
+   这个接口带缓存、极轻，而且没变化时本轮完全不碰 DOM（不闪、不重排）。
+   想彻底关掉：localStorage 里设 wv_autorefresh = '0'。 */
+const AR_MS = 20000;
+const AR_PAGE = 200;   // 单次追加上限
+const AR_ROUNDS = 3;   // 增量回溯轮数上限，防止一次补几千条把页面拖死
+                       // 上限是 599 条不是 600：3 轮 × 200 的最后一条是 DOM 末条本身
+
+let arTimer = null;
+let arBusy = false;
+let arBase = null;     // {loaded, count}；null = 还没拿到基线（首轮只记录、不触发）
+
+function arOn() {
+  return localStorage.getItem('wv_autorefresh') !== '0';
+}
+
+/* 面板打开 / 正在加载更早消息时先别动列表，否则会把用户正在看的东西顶飞 */
+function arBlocked() {
+  if (state.loadingMore) return true;
+  const ids = ['#searchPanel', '#datePanel', '#statsPanel',
+               '#archivePanel', '#exportPanel', '#lightbox', '#findBar'];
+  for (const sel of ids) {
+    const el = $(sel);
+    if (el && el.style.display !== 'none') return true;
+  }
+  return false;
+}
+
+async function arTick() {
+  if (arBusy || document.hidden || !arOn()) return;
+  arBusy = true;
+  try {
+    let st;
+    try {
+      st = await api('/api/status');
+    } catch {
+      return;   // 后端重启 / 网络抖动都交给下一轮，绝不弹窗
+    }
+    const now = {
+      loaded: Number(st.loaded_at || 0),
+      count: Number(st.msg_count || 0),
+      convs: Number(st.conv_count || 0),
+    };
+    if (!arBase) { arBase = now; return; }
+    // 三项全同才算"什么都没发生"；只比 loaded_at/count 的话，会话数变化会被这里提前吃掉
+    if (now.loaded === arBase.loaded && now.count === arBase.count
+        && now.convs === arBase.convs) return;
+    if (st.loading) return;   // 后端正在重载，这会儿读到的是半成品
+    // 被面板挡住时不推进基线，等用户关掉之后的那一轮再补上
+    if (arBlocked()) return;
+    // loaded_at 每次 reload 都会变，但空扫描时数据其实没变 —— 只有条数/会话数真的变了
+    // 才值得重排侧栏，否则页面每 20 秒白闪一下。
+    const dataChanged = now.count !== arBase.count || now.convs !== arBase.convs;
+    arBase = now;
+    if (!dataChanged) return;
+    await arRefresh(st);
+  } finally {
+    arBusy = false;
+  }
+}
+
+async function arRefresh(st) {
+  $('#sbStatus').textContent =
+    `${st.conv_count ?? 0} 个会话 · ${st.msg_count ?? 0} 条消息` +
+    (st.account_count > 1 ? ` · ${st.account_count} 个账号` : '');
+
+  const convId = state.current;
+  try {
+    await loadConvs();   // 内部会按 state.current 重新标选中态，选中不会丢
+  } catch {
+    // 列表接口失败不该拖累下面的消息追加
+  }
+  if (!convId || state.current !== convId) return;
+
+  const prevTotal = Number(state.msgTotal || 0);
+  const res = await arAppend(convId);
+  if (res !== 'gap') return;
+  if (state.current !== convId) return;   // arAppend 里有 await，期间可能已经切走
+  if (!state.msgLoaded) return;           // 会话正在打开 / 本来就是空会话，别重复重建
+
+  // 落后太多（新旧之间隔了大段没加载的消息）时不能精细追加 —— 否则分页 offset
+  // 与 DOM 里的消息就对不上了，只能重建最新一页。但重建会把用户拽走，所以先确认他真的
+  // 停在会话尾部：「贴底」不够，中间窗口的底只是那个窗口的底。新消息只会追加在末尾，
+  // 所以旧数据的最后一条在 asc 分页里位置固定，拿它跟 DOM 末条一比就能分辨。
+  const sc = $('#msgScroller');
+  if (sc.scrollHeight - sc.scrollTop - sc.clientHeight >= 80) return;
+  const nodes = $$('[data-mid]', $('#msgList'));
+  const lastMid = nodes.length ? String(nodes[nodes.length - 1].dataset.mid || '') : '';
+  if (!lastMid || prevTotal < 1) return;
+  let edge;
+  try {
+    edge = await api(`/api/messages?conv_id=${encodeURIComponent(convId)}`
+      + `&offset=${prevTotal - 1}&limit=1&order=asc`);
+  } catch {
+    return;
+  }
+  if (state.current !== convId) return;
+  if (!edge.items.length || String(edge.items[0].msg_id) !== lastMid) return;
+  // 上面那次往返期间用户可能已经往上翻了，重建会把他的位置吃掉，再确认一次
+  if (sc.scrollHeight - sc.scrollTop - sc.clientHeight >= 80) return;
+  await openConv(convId);
+}
+
+/* 从最新一条往回翻，直到翻到"当前 DOM 里的最后一条"为止；中间的都是新增。
+   返回 appended=已追加 / none=没有新增 / gap=追不平（列表为空、断层太大、条数没涨）交给上层兜底。 */
+async function arAppend(convId) {
+  const list = $('#msgList');
+  const nodes = $$('[data-mid]', list);
+  const lastMid = nodes.length ? String(nodes[nodes.length - 1].dataset.mid || '') : '';
+  if (!lastMid) return 'gap';
+  const seen = new Set(nodes.map(el => String(el.dataset.mid || '')));
+
+  const prevTotal = Number(state.msgTotal || 0);
+  const fresh = [];
+  let total = prevTotal;
+  let totalAtStart = -1;   // 首轮响应里的 total，用来发现"翻页途中后端又写入"
+  let joined = false;
+  for (let round = 0; round < AR_ROUNDS; round++) {
+    let d;
+    try {
+      d = await api(`/api/messages?conv_id=${encodeURIComponent(convId)}`
+        + `&offset=${round * AR_PAGE}&limit=${AR_PAGE}&order=desc`);
+    } catch {
+      return 'none';
+    }
+    if (!d.items.length) break;   // 越界 / 空会话：按兜底处理，上层还会再核一次会话
+    // 这轮请求在路上时用户可能已经切走，回来就是别的会话的视图了 —— 一条都不能动
+    if (state.current !== convId) return 'none';
+    total = Number(d.total || 0);
+    // offset 分页在"翻页途中后端又写入"时会整体后移，这一轮拿到的页已经和上一页错位，
+    // 硬拼会出现重复/空洞；数据是活的，丢掉等下一轮就能对齐，别往 DOM 里塞错的东西。
+    if (totalAtStart < 0) totalAtStart = total;
+    else if (total !== totalAtStart) return 'none';
+    // 同一页里可能前半段是已渲染的旧窗口、后半段是新增，所以按 mid 逐条筛
+    fresh.unshift(...d.items.filter(m => !seen.has(String(m.msg_id))));
+    if (d.items.some(m => String(m.msg_id) === lastMid)) { joined = true; break; }
+  }
+  if (!joined) return 'gap';
+  if (!fresh.length) return 'none';
+  // 条数真变少（重扫删过消息）时 DOM 已经和库对不上，desc offset 的基准也不可信，交兜底。
+  // delta === 0 不用挡：不变量是 total - DOM首条秩，两边都没变，继续追加正好能补齐尾部。
+  const delta = (total || 0) - prevTotal;
+  if (delta < 0) return 'gap';
+
+  const sc = $('#msgScroller');
+  const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80;
+  const keepTop = sc.scrollTop;
+  renderMessages(fresh, 'append');
+  state.msgTotal = total;
+  // msgLoaded 的语义是 loadMore 用的 desc offset，即「从最新一条到 DOM 首条的条数」。
+  // 追加不会改变 DOM 首条，所以它的增量只能取后端总条数的涨幅；加 fresh.length
+  // 会把「首条之前、本来就没加载的那一段」重复算一遍，之后 loadMore 就永远取不到它们。
+  state.msgLoaded += delta;
+  arPaintHeader();
+  updateLoadMoreHint();
+  // 在底部就跟着滚；不在底部则把位置钉住（追加会让 scrollHeight 变大，不动即"不打断阅读"）
+  // 已知限制：loadMore 正好在飞行中时它自己也在补偿 scrollTop（见 loadMore 尾部），两边
+  // 会互相影响，可能有一次几十像素的跳动。arBlocked() 已经挡住了绝大多数情况，剩下的
+  // 窗口很小，暂不为它加锁 —— 别为此改逻辑。
+  if (atBottom) scrollToBottom(false);
+  else sc.scrollTop = keepTop;
+  return 'appended';
+}
+
+function arPaintHeader() {
+  const conv = state.convs.find(c => c.conv_id === state.current) || state.curConv;
+  if (!conv) return;
+  const n = state.msgTotal || conv.n_msg || 0;
+  $('#chatSub').textContent =
+    `${n} 条消息 · ${String(conv.source || '').toUpperCase()}` +
+    (conv.is_group ? ` · ${(conv.members || []).length} 人` : '');
+}
+
+function arStart() {
+  if (arTimer || !arOn()) return;
+  arTimer = setInterval(arTick, AR_MS);
+}
+
+function arStop() {
+  if (!arTimer) return;
+  clearInterval(arTimer);
+  arTimer = null;
+}
+
+/* 后台标签页不轮询；切回前台立刻查一次，不用再等 20 秒 */
+function arBind() {
+  if (!arOn()) return;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { arStop(); return; }
+    arStart();
+    arTick();
+  });
+  arStart();
+  arTick();   // 首轮只建立基线，不会把自己当成"有新消息"
 }
 
 /* ------------------------------ 查找聊天记录 ------------------------------ */
@@ -1325,6 +1537,7 @@ async function boot() {
   state.account = localStorage.getItem('wv-account') || '';
 
   bind();
+  arBind();
   await checkAuth();
   try {
     const st = await api('/api/status');
