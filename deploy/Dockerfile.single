@@ -149,14 +149,20 @@ RUN apt-get update \
 EXPOSE 8790 3000 3001
 
 # ---------------------------------------------------------------------------
-# 9) 自动同步服务（s6）：监视微信消息库变化 → 解密入库 → 媒体关联 → 重载
-#    注册为 s6 longrun，随容器启动、崩溃自拉起，不依赖桌面会话存活。
+# 9) 密钥提取工具 + 自动同步服务（s6）
 #
-#    ⚠️ 必须放在 Dockerfile 最末尾：它只 COPY 一个几 KB 的 shell 脚本，
-#    放在中间会让紧随其后的大层（apt 装 sqlcipher/gdb/ffmpeg ≈ 数百 MB）
-#    缓存全部失效，任何 s6 微调都要重跑十几分钟的 apt。
-#    放末尾则前面的重层全部命中缓存，重建只需秒级。
+#    ⚠️ 都放在最末尾：它们只是几个小文件，放在中间会让紧随其后的大层
+#    （apt 装 sqlcipher/gdb/ffmpeg ≈ 数百 MB）缓存全部失效，
+#    改一行就要重跑十几分钟。放末尾则前面重层全部命中缓存。
 # ---------------------------------------------------------------------------
+# 9.1 密钥提取工具：首次使用时必须能在容器里跑——否则用户装完容器、
+#     登录了微信，却拿不到密钥，永远同步不了。只挑运行时要用的 .py，
+#     不整目录 COPY（那里还有 preflight.sh / push-to-github.sh 等开发脚本）。
+COPY tools/wv_keymem.py tools/wv_keyscan.py tools/wv_winkey.py \
+     tools/wv_wxdb.py tools/wv_kdfprobe.py /app/tools/
+
+# 9.2 自动同步：监视微信消息库变化 → 解密入库 → 媒体关联 → 查看器重载
+#     注册为 s6 longrun，随容器启动、崩溃自拉起，不依赖桌面会话存活。
 COPY deploy/s6/svc-autosync /etc/s6-overlay/s6-rc.d/svc-autosync
 RUN chmod 755 /etc/s6-overlay/s6-rc.d/svc-autosync/run \
  && touch /etc/s6-overlay/s6-rc.d/user/contents.d/svc-autosync
