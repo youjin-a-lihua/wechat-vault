@@ -179,6 +179,13 @@ def decrypt_all(account: Path, plain_out: Path, keys: dict,
         total += 1
         if decrypt_one(src, plain_out / rel, ent[0], ent[1], passphrase_hex=passphrase_hex):
             ok += 1
+        elif rel.startswith("session"):
+            # session.db 决定「哪个 Msg 表属于哪个会话」。它解不开时，
+            # 后面的同步会 tables=0、但 exit code 仍是 0、指纹照常推进 ——
+            # 结果是**静默永久停止同步**，没有任何日志说明原因。
+            # 这里单独喊一声，让人知道是密钥问题而不是"没有新消息"。
+            log.error("session.db 解密失败（%s）：会话归属将无法确定，本轮不会同步任何消息。"
+                      "若此前能同步，说明账号级密钥已失效，请重新定标密钥", rel)
     log.info("解密完成：%d/%d", ok, total)
     return ok
 
@@ -311,9 +318,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         source_file TEXT, created_at INTEGER, sender_username TEXT DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts);
-    # 覆盖 /api/messages 的完整排序键：只有 (conv_id, ts) 时，
-    # ts 之后的 seq/msg_id 两个排序键要走 TEMP B-TREE，
-    # 等于把整个会话（实测最大 18 万条）取出来再排序取前 200
+    -- 覆盖 /api/messages 的完整排序键：只有 (conv_id, ts) 时，
+    -- ts 之后的 seq/msg_id 两个排序键要走 TEMP B-TREE，
+    -- 等于把整个会话（实测最大 18 万条）取出来再排序取前 200
+    -- （SQLite 的 executescript 只认 -- 注释，写 # 会直接 unrecognized token）
     CREATE INDEX IF NOT EXISTS idx_msg_conv_ts_full ON msg(conv_id, ts, seq, msg_id);
     CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg(ts);
     CREATE INDEX IF NOT EXISTS idx_msg_type ON msg(type);
@@ -371,8 +379,19 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
     if limit_tables:
         files = files[:limit_tables]
 
+    # 会话表名是 md5(username)，必须拿 session.db 的 username 列表反查归属。
+    # 这里为空时后面会 tables=0 —— 若不当回事，autosync 会当成"没有新消息"
+    # 照常推进指纹，从此静默停止同步。所以必须显式报错。
+    if not sessions:
+        log.error("session.db 读不到会话列表（解密失败或表为空）：无法确定消息归属，"
+                  "本轮不会同步任何消息。通常是账号级密钥失效，请重新定标")
+    elif not files:
+        log.error("明文库下没有 message_*.db：要么解密失败，要么微信改了目录结构")
+
     now = int(time.time())
     for f in files:
+        # c 先置 None：_ro() 抛异常时 finally 里才知道不用关
+        c = None
         try:
             c = _ro(f)
         except sqlite3.Error as e:
@@ -399,27 +418,42 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             cid = "%s::%s" % (account_name, ctitle)
             stats["tables"] += 1
 
+            # 表名要拼进 SQL：按已知形态校验 + 双引号包裹，双保险
+            if not re.fullmatch(r"Msg_[0-9a-f]{32}", t):
+                log.warning("跳过形态异常的消息表名：%r", t)
+                continue
             rows = c.execute(
                 "SELECT local_id, local_type, create_time, real_sender_id, "
                 "message_content, WCDB_CT_message_content "
-                "FROM %s" % t)
+                'FROM "%s"' % t)
             batch = []
             for local_id, ltype, ctime, sender_id, content, ct in rows:
-                if not ctime or ctime < since_ts:
+                # 单行解析失败只跳过这一条。原来这里没有任何保护：
+                # 一条脏数据（ltype 非 int、content 非 bytes/str、ctime 超出
+                # strftime 范围）就会抛穿整个循环 → 本轮全部 136 万条白跑。
+                try:
+                    if not ctime or ctime < since_ts:
+                        continue
+                    base_id = int(ltype) & 0xFFFFFFFF
+                    base = BASE_TYPE.get(base_id, "other")
+                    text = _decompress(content, zb)
+                    prefix, body = _strip_sender(text, known_users)
+                    # sender_id 是本库 Name2Id 的 rowid，先翻译回真实 username
+                    sender_user = n2i.get(sender_id, "")
+                    is_self = 1 if sender_user == me else 0
+                    who = by_user.get(sender_user, {})
+                    sender = (who.get("remark") or who.get("nick")
+                              or sender_user or prefix or str(sender_id))
+                    content_out = _summarize(base, body)
+                    mid = MSG_PREFIX + hashlib.sha1(
+                        ("%s|%s|%s" % (cid, local_id, ctime)).encode()).hexdigest()[:12]
+                except Exception as e:
+                    stats["bad_rows"] = stats.get("bad_rows", 0) + 1
+                    # 只详细报前几条：真出事时往往是成片的，全打会刷屏
+                    if stats["bad_rows"] <= 5:
+                        log.warning("跳过无法解析的消息 %s/%s#%s：%s: %s",
+                                    f.name, t, local_id, type(e).__name__, e)
                     continue
-                base_id = int(ltype) & 0xFFFFFFFF
-                base = BASE_TYPE.get(base_id, "other")
-                text = _decompress(content, zb)
-                prefix, body = _strip_sender(text, known_users)
-                # sender_id 是本库 Name2Id 的 rowid，先翻译回真实 username
-                sender_user = n2i.get(sender_id, "")
-                is_self = 1 if sender_user == me else 0
-                who = by_user.get(sender_user, {})
-                sender = (who.get("remark") or who.get("nick")
-                          or sender_user or prefix or str(sender_id))
-                content_out = _summarize(base, body)
-                mid = MSG_PREFIX + hashlib.sha1(
-                    ("%s|%s|%s" % (cid, local_id, ctime)).encode()).hexdigest()[:12]
                 batch.append((mid, cid, account_name, local_id, ctime,
                               time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ctime)),
                               sender, is_self, base, content_out,
@@ -434,10 +468,21 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                     "SELECT msg_id, sender, sender_username, is_self"
                     " FROM msg WHERE msg_id=?", (b[0],)).fetchone()
                 if not row:
-                    # 兼容另一条导入路径（JSON 导入的 mid 前缀不同）。
-                    # 兜底键**不含 content**：content 会被重算（剥离发送者前缀），
-                    # 拿新 content 去比对旧记录必然落空，那样会把同一条消息
-                    # 重复插一份（实测过一次，多出 39 万条）。
+                    # 兜底：只服务「另一条导入路径」（JSON 导入的 mid 前缀是
+                    # json-，与这里的 db- 不同，所以 msg_id 必然不命中）。
+                    #
+                    # 为什么**不能**加 seq：JSON 记录里的 seq 是文件内序号，
+                    # 与微信的 local_id 是两套编号，永远对不上。加了 seq 的
+                    # 后果是这 81 万条跨源重复全部失配、被当成新消息插一遍
+                    # （实测过一次：一轮多出 805,071 条）。
+                    #
+                    # 为什么**不能**用 content：它会被重算（剥离发送者前缀），
+                    # 拿新值比对旧记录必然落空，同样会把同一条消息插两份
+                    # （更早实测过一次，多出 390,288 条）。
+                    #
+                    # 至于"同一秒连发两条会被吞"——那需要先走到兜底才会发生，
+                    # 而 wxdb 自己的消息 msg_id 必然命中上面那条主路径，
+                    # 根本到不了这里。所以这个键在实际同步场景是安全的。
                     row = conn.execute(
                         "SELECT msg_id, sender, sender_username, is_self"
                         " FROM msg WHERE conv_id=? AND ts=? AND sender=? AND is_self=?"
@@ -576,6 +621,11 @@ def main() -> int:
                           self_wxid=_self_wxid(account))
     log.info("同步完成：%d 个会话表 / 新增 %d 条消息 / 跳过重复 %d 条 / 修正发送者与己方标记 %d 条",
              stats["tables"], stats["msg"], stats["skip_dup"], stats["backfill"])
+    # 一个会话表都没匹配上 = 同步实际失败，必须返回非 0。
+    # 否则 autosync 只会看到 exit 0、照常推进指纹，从此静默停止同步，
+    # 日志里连一句"出问题了"都没有。
+    if stats["tables"] == 0:
+        return 4
     return 0
 
 if __name__ == "__main__":
