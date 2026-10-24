@@ -103,3 +103,6 @@ deploy/vendor/wxextract.tar.gz
 tests/_nas_*.py
 tests/_clean_demo.sh
 tests/compat_real_report.json
+
+# 第三方项目参考文件（WechatOnCloud），只在开发期对照用，不进仓库
+_woc_ref_*.txt

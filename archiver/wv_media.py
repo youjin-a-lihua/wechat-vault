@@ -64,6 +64,14 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# 时区偏移（小时）：默认东八区。微信按本地时间分库（message_YYYY-MM.db），
+# 海外部署用 WV_TZ_OFFSET 覆盖，否则会去错的月份分库里找图。
+try:
+    TZ_OFFSET = float(os.environ.get("WV_TZ_OFFSET", "8"))
+except ValueError:
+    TZ_OFFSET = 8.0
+TZ = dt.timezone(dt.timedelta(hours=TZ_OFFSET))
+
 V2_MAGIC = b"\x07\x08V2\x08\x07"
 FIXED_BLOCK = bytes.fromhex("4b34278883a017cadb25201c644dafad")
 IMAGE_MAGIC = {
@@ -541,9 +549,8 @@ def run_link(vault: str, plain_dbs: str, idx: dict) -> dict:
     print("  明文库图片消息：%d 条" % len(psizes))
 
     def month_of(ts: int) -> str:
-        """消息时间 → 明文库分库月份（固定东八区，微信分库按本地时间）。"""
-        return dt.datetime.fromtimestamp(
-            ts, dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m")
+        """消息时间 → 明文库分库月份（按 WV_TZ_OFFSET，微信分库用本地时间）。"""
+        return dt.datetime.fromtimestamp(ts, TZ).strftime("%Y-%m")
 
     conn = sqlite3.connect(vault)
     conn.row_factory = sqlite3.Row
@@ -720,9 +727,8 @@ def main():
 #            判据 = (chat_name_id → Name2Id.user_name 的 hash, create_time)
 
 def _month8(ts: int) -> str:
-    """消息时间 → 微信分库月份（固定东八区）。"""
-    return dt.datetime.fromtimestamp(
-        ts, dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m")
+    """消息时间 → 微信分库月份（按 WV_TZ_OFFSET）。"""
+    return dt.datetime.fromtimestamp(ts, TZ).strftime("%Y-%m")
 
 def run_videos(account_root: str, vault: str, out: str, plain_dbs: str = "") -> dict:
     """视频：按 (月份, 缩略图字节数) 关联；优先给可播放的 mp4，否则给封面图。"""

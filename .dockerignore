@@ -1,0 +1,54 @@
+# Docker 构建上下文排除清单
+#
+# 为什么需要：构建上下文默认包含仓库根的一切，而本项目根目录混着
+# 密钥提取日志（local_keys/）、归档数据（store/）、UI 截图（_shots_*/）。
+# 不排除的后果有两个，都不是"慢一点"这么轻：
+#   1. 上下文从 ~1MB 膨胀到数百 MB，每次 build 都要打包上传给 daemon
+#   2. 敏感文件会被塞进 build context，可能残留在构建缓存层里被捞出来
+#
+# 原则：只排除"构建绝对用不到"的东西；Dockerfile 里 COPY 到的路径一个都不能挡。
+# Dockerfile.single 实际 COPY 的只有：requirements.txt、parser/、archiver/、
+# viewer/、deploy/{Dockerfile,wechat-runtime.sh,autostart,wv-*,s6,vendor}。
+
+# 版本控制与编辑器
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# 敏感：密钥提取日志、归档数据、本地备份
+local_keys/
+store/
+*_credentials.json
+*token*.json
+
+# UI 截图与调试产物
+_shots_*/
+_chr_profile*/
+
+# 日志
+*.log
+
+# 第三方参考文件（仅供开发时对照，不进镜像）
+_woc_ref_*.txt
+
+# 测试：含真实 NAS 路径的私有脚本一律不进构建上下文
+tests/
+
+# 文档与示例（运行时不需要）
+docs/
+samples/
+
+# Python 产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 开发期临时脚本（根目录下划线开头的草稿）
+_bench_*.py
+_fix_*.py
+_diag*.py
+_probe_*.json
+
+# 部署现场的本地配置（含口令，绝不进镜像）
+deploy/.env
