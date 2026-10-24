@@ -618,6 +618,19 @@ def _ensure_schema(db: Path) -> None:
             """)
             changed = True
 
+        # 补齐索引（自愈没有索引的库）。idx_msg_conv_ts_full 覆盖
+        # /api/messages 的完整排序键，缺 seq/msg_id 时会退化成 TEMP B-TREE
+        for idx_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts)",
+            "CREATE INDEX IF NOT EXISTS idx_msg_conv_ts_full"
+            " ON msg(conv_id, ts, seq, msg_id)",
+            "CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg(ts)",
+        ):
+            try:
+                c.execute(idx_sql)
+            except sqlite3.Error:
+                pass        # 表不存在等：下次启动再试，不阻断启动
+
         if "account" in cols(c, "conv"):
             c.execute("UPDATE conv SET account=? WHERE account IS NULL OR account=''",
                       (DEFAULT_ACCOUNT,))

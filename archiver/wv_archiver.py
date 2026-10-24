@@ -266,6 +266,9 @@ CREATE TABLE IF NOT EXISTS msg (
     sender_username TEXT DEFAULT ''  -- 发送者 username（显示名会重名，头像靠它精确匹配）
 );
 CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts);
+-- 覆盖消息列表的完整排序键（见 wv_sync 里的说明）：缺 seq/msg_id 时
+-- ORDER BY ts, seq, msg_id 会退化成 TEMP B-TREE，大群要把全表取出来再排序
+CREATE INDEX IF NOT EXISTS idx_msg_conv_ts_full ON msg(conv_id, ts, seq, msg_id);
 CREATE INDEX IF NOT EXISTS idx_msg_ts      ON msg(ts);
 CREATE INDEX IF NOT EXISTS idx_msg_type    ON msg(type);
 CREATE INDEX IF NOT EXISTS idx_msg_account ON msg(account);

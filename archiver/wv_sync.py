@@ -311,6 +311,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         source_file TEXT, created_at INTEGER, sender_username TEXT DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts);
+    # 覆盖 /api/messages 的完整排序键：只有 (conv_id, ts) 时，
+    # ts 之后的 seq/msg_id 两个排序键要走 TEMP B-TREE，
+    # 等于把整个会话（实测最大 18 万条）取出来再排序取前 200
+    CREATE INDEX IF NOT EXISTS idx_msg_conv_ts_full ON msg(conv_id, ts, seq, msg_id);
     CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg(ts);
     CREATE INDEX IF NOT EXISTS idx_msg_type ON msg(type);
     CREATE INDEX IF NOT EXISTS idx_msg_account ON msg(account);
