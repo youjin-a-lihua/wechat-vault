@@ -876,14 +876,22 @@ def api_messages(
     limit: int = Query(200, ge=1, le=2000),
     order: str = Query("asc", description="asc | desc"),
 ):
-    """分页拉取某会话的消息。"""
+    """分页拉取某会话的消息。
+
+    排序必须按 ts，不能按 seq：seq 来自两套互不相干的编号——JSON 导入的是
+    文件内序号、微信库同步的是 local_id，两者混在同一会话里时大小关系没有意义。
+    按 seq 排会把 10 月初导入的消息排到 10 月底同步的消息前面，
+    表现为「前端最新一条停在很早的日期」。seq 只作为同秒消息的稳定 tiebreaker。
+    """
     direction = "DESC" if order == "desc" else "ASC"
     with _db() as conn:
         total = conn.execute(
             "SELECT COUNT(*) FROM msg WHERE conv_id=?", (conv_id,)
         ).fetchone()[0]
         rows = [dict(r) for r in conn.execute(
-            f"SELECT * FROM msg WHERE conv_id=? ORDER BY seq {direction} LIMIT ? OFFSET ?",
+            f"SELECT * FROM msg WHERE conv_id=?"
+            f" ORDER BY ts {direction}, seq {direction}, msg_id {direction}"
+            f" LIMIT ? OFFSET ?",
             (conv_id, limit, offset),
         )]
     if order == "desc":
@@ -1024,7 +1032,8 @@ def api_locate(
             "SELECT COUNT(*) FROM msg WHERE conv_id=? AND ts>=? AND ts<?",
             (conv_id, lo, lo + 86400)).fetchone()[0]
         row = conn.execute(
-            "SELECT seq, ts, msg_id FROM msg WHERE conv_id=? AND ts>=? ORDER BY seq LIMIT 1",
+            "SELECT seq, ts, msg_id FROM msg WHERE conv_id=? AND ts>=?"
+            " ORDER BY ts, seq LIMIT 1",
             (conv_id, lo)).fetchone()
         if not row:
             return {"date": day, "found": False, "total": total,
