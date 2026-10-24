@@ -86,11 +86,51 @@ docker exec wechat-vault /opt/wx-venv/bin/python3 /app/archiver/wv_sync.py story
 `story` 做三件事：解密数据库 → 读消息写入 vault.db → 供查看器展示。
 之后跑一次媒体链路把图片、视频、语音接上（见下文「核心能力」）。
 
-密钥说明：
+### 首次使用：密钥从哪来
 
-- `all_keys.json` 存的是每个库的 `enc_key` 快照，库被微信重建后这份快照会失效
-- `passphrase.json`（与 `all_keys.json` 同目录）存账号级 password，可据此为任意库重新派生密钥，长期有效
-- `wv_sync.py` 会优先用 `passphrase.json`，没有时才回退到 `all_keys.json`
+方舟读的是微信自己的 SQLCipher 加密库，**必须先拿到密钥才能解密**。
+这一步目前没有「一键搞定」的方案，看你手上有什么：
+
+#### 情况 1：你已经有密钥文件
+
+把两个文件放进 `/data/wx_backup/`：
+
+- `passphrase.json` —— 账号级 password。**优先用这个**：它能为任意库重新派生密钥，
+  库被微信重建也不会失效
+- `all_keys.json` —— 每个库的 `enc_key` 快照。库被微信重建后这份快照就失效了
+
+`wv_sync.py` 会优先用 `passphrase.json`，没有时才回退到 `all_keys.json`。
+
+#### 情况 2：从运行中的微信进程里取
+
+容器内自带三个工具（`/app/tools/`）：
+
+```bash
+# 按库的 salt 在微信进程内存里找 enc_key
+docker exec -it wechat-vault /opt/wx-venv/bin/python3 /app/tools/wv_keymem.py \
+    --account-dir /config/xwechat_files/<wxid>_<后缀> \
+    --db message/message_0.db \
+    --out /tmp/keys.json
+
+# 思路相同、扫描策略更宽（salt 锚点 ±256 字节提取候选）
+docker exec -it wechat-vault /opt/wx-venv/bin/python3 /app/tools/wv_keyscan.py
+
+# Windows 上一份微信的密钥，用这个（纯 Python，无需第三方依赖）
+python tools/wv_winkey.py
+```
+
+> **如实说明**：这条路不是开箱即用的。在微信 4.1.23 / Linux 版上实测，
+> `wv_keymem` 能找到 salt 的内存锚点（627 个可扫描区间、7 处命中），
+> 但提取出的候选 key 都没通过 HMAC 校验——微信把派生入参的存放位置
+> 与版本强相关。**换版本可能要重新调试**，这一步需要一点逆向耐心。
+> 卡住的话，情况 3 更省事。
+
+#### 情况 3：完全不碰密钥
+
+用第三方工具（WeChatMsg、PyWxDump 这类）在 Windows 上把聊天记录
+导出成 JSON / HTML，再按下面「把其他电脑上的聊天记录搬过来」的方案 B 导入。
+**这条路不需要任何密钥**，代价是拿到的是导出那一刻的快照，
+之后的新消息接不上自动同步。
 
 > 详情见下文「部署」与 `docs/计划书.md`。
 
