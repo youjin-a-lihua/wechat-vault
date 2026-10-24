@@ -160,6 +160,9 @@ EXPOSE 8790 3000 3001
 #     不整目录 COPY（那里还有 preflight.sh / push-to-github.sh 等开发脚本）。
 COPY tools/wv_keymem.py tools/wv_keyscan.py tools/wv_winkey.py \
      tools/wv_wxdb.py tools/wv_kdfprobe.py /app/tools/
+# 源文件权限是 700，COPY 会原样保留；放宽到 755 免得后面有人以为读不到。
+# （实际跑密钥提取要读 /proc/<pid>/mem，仍需 root，docker exec 默认就是）
+RUN chmod 755 /app/tools/*.py
 
 # 9.2 自动同步：监视微信消息库变化 → 解密入库 → 媒体关联 → 查看器重载
 #     注册为 s6 longrun，随容器启动、崩溃自拉起，不依赖桌面会话存活。
