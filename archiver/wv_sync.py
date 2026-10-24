@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -77,6 +78,24 @@ def load_passphrase(keys_path: Path) -> str:
         return v if (isinstance(v, str) and len(v) == 64) else ""
     except (ValueError, OSError):
         return ""
+
+def _self_wxid(account: Path) -> str:
+    """账号目录名 → 真实 wxid（判断「这条是不是我发的」要用它）。
+
+    目录形如 `wxid_og6rczn7wbzm22_2c37`，尾部 `_2c37` 是设备后缀，
+    真实 wxid 是 `wxid_og6rczn7wbzm22`。不能简单 split("_")[0] —— 那只会
+    拿到字符串 "wxid"，导致 self_ids 恒为空集、**所有消息都被判成对方发的**，
+    前端表现为左右角色全错（实测 55.9 万条消息中 is_self=1 的为 0）。
+    """
+    name = account.name
+    m = re.match(r"^(wxid_[0-9A-Za-z]+)_[0-9a-fA-F]{3,10}$", name)
+    if m:
+        return m.group(1)
+    if name.startswith("wxid_"):
+        return name
+    # 自定义微信号：去掉尾部设备后缀即可
+    return re.sub(r"_[0-9a-fA-F]{3,10}$", "", name) or name
+
 
 def find_account(wechat_files: Path, wxid: str = "") -> Path:
     """在 xwechat_files 下定位账号目录（含 db_storage 的那个）。"""
@@ -289,6 +308,30 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if "sender_username" not in cols:
         conn.execute("ALTER TABLE msg ADD COLUMN sender_username TEXT DEFAULT ''")
 
+def read_name2id(msg_db: Path) -> dict[int, str]:
+    """message 库自己的 id → username。
+
+    `real_sender_id` 指向本库 `Name2Id` 的 rowid，**不是 contact.db 的 id**。
+    这两套 id 空间完全不同（实测自己的 contact.id=85，而在各 message 库的
+    Name2Id 里 rowid=3）。以前拿 contact.db 的 id 去解，等于查错了表：
+    sender 靠消息体前缀兜底才勉强看着对，而 is_self 几乎全错——
+    55.9 万条同步消息里被判定为「我发的」只有 145 条。
+    """
+    out: dict[int, str] = {}
+    try:
+        conn = _ro(msg_db)
+        try:
+            for rowid, name in conn.execute("SELECT rowid, user_name FROM Name2Id"):
+                if name:
+                    out[rowid] = name
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log.warning("读取 %s 的 Name2Id 失败（%s）：该库发送者回退到前缀解析",
+                    msg_db.name, e)
+    return out
+
+
 def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                   since_ts: int = 0, limit_tables: int = 0,
                   self_wxid: str = "") -> dict:
@@ -296,7 +339,9 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
     contacts = read_contacts(plain)
     sessions = read_sessions(plain)
     me = self_wxid or (account_name.split("_")[0] if "_" in account_name else account_name)
-    self_ids = {i for i, v in contacts.items() if v["username"] == me}
+    # username → contact 行（备注/昵称）。注意：必须按 username 查，
+    # 不能按 contact.db 的自增 id 查 —— 那是另一个 id 空间。
+    by_user = {v["username"]: v for v in contacts.values() if v.get("username")}
 
     zb = zstd.ZstdDecompressor() if zstd else None
     conn = sqlite3.connect(str(vault))
@@ -316,6 +361,8 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
         except sqlite3.Error as e:
             log.warning("打开失败 %s：%s", f.name, e)
             continue
+        # 每个 message 库都有自己的 Name2Id，必须逐库读
+        n2i = read_name2id(f)
         try:
             tabs = [r[0] for r in c.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg\\_%' ESCAPE '\\'")]
@@ -346,11 +393,12 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                 base = BASE_TYPE.get(base_id, "other")
                 text = _decompress(content, zb)
                 prefix, body = _strip_sender(text)
-                is_self = 1 if sender_id in self_ids else 0
-                who = contacts.get(sender_id, {})
-                sender = who.get("remark") or who.get("nick") or who.get("username") or prefix or str(sender_id)
-                # 显示名不唯一（实测 199 组重名），头像必须靠 username 才能精确对上
-                sender_user = who.get("username") or ""
+                # sender_id 是本库 Name2Id 的 rowid，先翻译回真实 username
+                sender_user = n2i.get(sender_id, "")
+                is_self = 1 if sender_user == me else 0
+                who = by_user.get(sender_user, {})
+                sender = (who.get("remark") or who.get("nick")
+                          or sender_user or prefix or str(sender_id))
                 content_out = _summarize(base, body)
                 mid = MSG_PREFIX + hashlib.sha1(
                     ("%s|%s|%s" % (cid, local_id, ctime)).encode()).hexdigest()[:12]
@@ -361,24 +409,27 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             if not batch:
                 continue
             fresh = []
-            backfill = []
+            update = []
             for b in batch:
                 row = conn.execute(
-                    "SELECT msg_id, sender_username FROM msg"
+                    "SELECT msg_id, sender, sender_username, is_self FROM msg"
                     " WHERE conv_id=? AND ts=? AND content=? LIMIT 1",
                     (b[1], b[4], b[9])).fetchone()
                 if row:
                     stats["skip_dup"] += 1
-                    # 老库没有 sender_username，趁这一轮已经读到明文库把它补上；
-                    # 只补空值，不覆盖已有数据
-                    if b[12] and not (row[1] or ""):
-                        backfill.append((b[12], row[0]))
+                    # 老数据的 sender / is_self 是用错的 id 空间算出来的
+                    # （把 contact.db 的 id 当成了 Name2Id 的 rowid），
+                    # 所以这里整条重算，而不是只补空值
+                    if ((row[1] or "") != b[6] or (row[2] or "") != b[12]
+                            or (row[3] or 0) != b[7]):
+                        update.append((b[6], b[12], b[7], row[0]))
                 else:
                     fresh.append(b[:10] + (None, None, b[10], b[11], b[12]))
-            if backfill:
+            if update:
                 conn.executemany(
-                    "UPDATE msg SET sender_username=? WHERE msg_id=?", backfill)
-                stats["backfill"] = stats.get("backfill", 0) + len(backfill)
+                    "UPDATE msg SET sender=?, sender_username=?, is_self=?"
+                    " WHERE msg_id=?", update)
+                stats["backfill"] = stats.get("backfill", 0) + len(update)
             if fresh:
                 conn.executemany(
                     "INSERT OR IGNORE INTO msg (msg_id, conv_id, account, seq, ts, time_str,"
@@ -494,8 +545,8 @@ def main() -> int:
         return 3
 
     stats = sync_messages(plain, Path(a.vault), DEFAULT_ACCOUNT, a.since, a.limit_tables,
-                          self_wxid=account.name.split("_")[0])
-    log.info("同步完成：%d 个会话表 / 新增 %d 条消息 / 跳过重复 %d 条 / 补填发送者 %d 条",
+                          self_wxid=_self_wxid(account))
+    log.info("同步完成：%d 个会话表 / 新增 %d 条消息 / 跳过重复 %d 条 / 修正发送者与己方标记 %d 条",
              stats["tables"], stats["msg"], stats["skip_dup"], stats["backfill"])
     return 0
 
