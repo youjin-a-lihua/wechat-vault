@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 归档器链路依赖 pycryptodome / zstandard，漏装会让测试直接 ImportError。
+      # 之前没有 CI，也没有任何地方说明"跑测试前先装这个"，新人一跑就撞墙。
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-archiver.txt
+
+      - name: 语法检查
+        run: |
+          python -m compileall -q archiver parser viewer
+          node --check viewer/static/app.js
+          node --check viewer/static/sw.js
+
+      # 提交前体检：凭据扫描、静默异常吞噬、SQL 拼接、前端检查
+      - name: preflight
+        run: bash tools/preflight.sh
+
+      # 只跑不依赖真实微信数据的用例；需要真实库的见 tests/ 下注释
+      - name: 单元测试
+        run: python -m unittest discover -s tests/unit -t .
