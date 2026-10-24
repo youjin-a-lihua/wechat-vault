@@ -94,6 +94,102 @@ docker exec wechat-vault /opt/wx-venv/bin/python3 /app/archiver/wv_sync.py story
 
 > 详情见下文「部署」与 `docs/计划书.md`。
 
+### 把其他电脑上的聊天记录搬过来
+
+上面讲的是「本机（容器内）微信登录后自动同步」。如果你的完整历史在**另一台电脑**上，
+方舟默认看不到它——它只读容器内 `/config/xwechat_files`。
+
+三条路，按可控程度排序。
+
+#### 方案 A：拷数据目录，单独导入（推荐）
+
+**适用**：能拿到原电脑的微信数据目录和密钥文件。
+**好处**：完全不碰容器内微信的数据目录，不影响它的登录态，导入完就是一次性的事。
+
+**① 原电脑上彻底退出微信**（托盘右键退出）。这一步别省——库还在写的时候拷出来可能是半截。
+
+**② 把两样东西拷到 NAS**（SMB、scp、移动硬盘都行）：
+
+| 拷什么 | 原机器位置 | 拷到 NAS |
+|---|---|---|
+| 微信数据目录 | `xwechat_files/<wxid>_<设备后缀>/` | `/data/imported/old-pc/xwechat_files/` |
+| 密钥（两个都要） | `all_keys.json` + `passphrase.json` | `/data/imported/old-pc/keys/` |
+
+目录长这样就行：
+
+```
+/data/imported/old-pc/
+├── xwechat_files/
+│   └── wxid_xxxxxxxx_2c37/        ← 整个账号目录，含 db_storage/ 和 msg/
+└── keys/
+    ├── all_keys.json
+    └── passphrase.json
+```
+
+**③ 导入消息**：
+
+```bash
+docker exec wechat-vault /opt/wx-venv/bin/python3 /app/archiver/wv_sync.py story \
+    --wechat-files /data/imported/old-pc/xwechat_files \
+    --keys        /data/imported/old-pc/keys/all_keys.json \
+    --vault       /data/vault.db \
+    --plain-out   /data/wx_backup/plain_dbs
+```
+
+**④ 接上图片视频**（不做这步，消息都在但图全是「[图片]」占位）：
+
+```bash
+docker exec wechat-vault /opt/wx-venv/bin/python3 /app/archiver/wv_media.py all \
+    --attach       /data/imported/old-pc/xwechat_files/wxid_xxxxxxxx_2c37/msg/attach \
+    --account-root /data/imported/old-pc/xwechat_files/wxid_xxxxxxxx_2c37 \
+    --vault        /data/vault.db \
+    --plain-dbs    /data/wx_backup/plain_dbs \
+    --out          /data/media
+```
+
+最后打开网页刷新即可看到。导入完成后 `/data/imported/` 可以删掉，
+之后的新消息继续由容器内微信的自动同步负责。
+
+> 两批数据写的是同一个 `vault.db`，会话按「账号 + 显示名」归并。
+> 所以**两台机器上同一会话的备注/群名要一致**，才会合成一个会话；
+> 如果原机器上给某人改了备注，这里就会多出一个会话——不是数据错乱，
+> 是同一个人被当成了两个。介意的话导入前把备注对齐。
+
+**可能卡住的地方**：
+
+- **报「缺少列 xxx，可能不兼容」**：两台机器的微信大版本不一致（库结构变了）。
+  升级原机器的微信到与容器内相同的大版本再拷，或改走方案 B。
+- **报「解密完成 0/24」**：密钥没能跨设备用。微信的 `passphrase.json` 通常
+  是账号级的，但不保证所有版本都如此——这种情况改走方案 B。
+- **数据量大**：`xwechat_files` 几十 GB 是常态，图片视频占大头。
+  先只拷 `db_storage/` 也能导入文字消息，附件以后补。
+
+#### 方案 B：导出成文件再导入
+
+**适用**：拿不到密钥，或者两台机器微信版本对不上。
+**代价**：依赖第三方导出工具，且导出的是「当时那一刻」的快照。
+
+1. 在原电脑上用导出工具把聊天记录导成 JSON / HTML / CSV / TXT
+   （WeChatMsg、PyWxDump、留痕 这类，选你能跑通的即可）
+2. 文件丢进容器的 `/data/inbox/<随便起的账号名>/`
+3. 网页上点「立即解析」，或者：
+
+```bash
+docker exec wechat-vault /opt/wx-venv/bin/python3 /app/archiver/wv_archiver.py scan \
+    --source /data/inbox --store /data
+```
+
+字段名会自动嗅探，兼容 WeChatMsg / PyWxDump / 微信官方导出这几种常见格式。
+
+#### 方案 C：用微信自带的「聊天记录迁移」
+
+源电脑微信里有「设置 → 聊天 → 聊天记录迁移与备份」，可以把记录迁到容器里的微信。
+好处是走官方通道、不碰密钥；限制是**微信对同一账号多台电脑同时在线的规则
+会决定这条路顺不顺**，迁移期间可能要在两台机器之间反复登录切换。
+
+适合只想搬一部分会话的场景。这条路的细节由微信客户端决定，本项目不做干预——
+迁完之后容器内的微信有了数据，自动同步会照常接手。
+
 ### 本地开发
 
 ```bash
