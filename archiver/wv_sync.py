@@ -239,12 +239,25 @@ def _decompress(v, zb) -> str:
         return v.decode("utf-8", "replace")
     return str(v)
 
-def _strip_sender(text: str) -> tuple[str, str]:
-    """群聊 content 形如 `发送者: 正文`，拆出前缀。"""
-    i = text.find(": ")
-    if 0 < i <= 64 and "\n" not in text[:i]:
-        return text[:i], text[i + 2:]
-    return "", text
+def _strip_sender(text: str, known: set[str] | None = None) -> tuple[str, str]:
+    """群聊正文形如 `发送者: 内容`，拆出前缀。
+
+    微信的写法**不统一**：有时是「冒号+空格」，有时是「冒号+换行」
+    （实测 `wxid_xxx:\\n正文`），所以不能只找 `": "`。
+
+    但也不能见冒号就拆——正文里「时间: 12:30」会被误伤。做法是传
+    该库 Name2Id 里的 username 集合做白名单，前缀命中才认；没有白名单时
+    退回到「像账号名」的保守正则（纯字母数字/下划线/@/点/横线）。
+    """
+    head, sep, rest = text.partition(":")
+    if not sep or not head or len(head) > 64 or "\n" in head:
+        return "", text
+    if known is not None:
+        if head not in known:
+            return "", text
+    elif not re.match(r"^[0-9A-Za-z_@.\-]+$", head):
+        return "", text
+    return head, rest.lstrip("\n").lstrip()
 
 def _xml_field(text: str, tag: str) -> str:
     """从消息 XML 里取一个简单字段（不引入 XML 解析器的开销）。"""
@@ -363,6 +376,7 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             continue
         # 每个 message 库都有自己的 Name2Id，必须逐库读
         n2i = read_name2id(f)
+        known_users = set(n2i.values())
         try:
             tabs = [r[0] for r in c.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg\\_%' ESCAPE '\\'")]
@@ -392,7 +406,7 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                 base_id = int(ltype) & 0xFFFFFFFF
                 base = BASE_TYPE.get(base_id, "other")
                 text = _decompress(content, zb)
-                prefix, body = _strip_sender(text)
+                prefix, body = _strip_sender(text, known_users)
                 # sender_id 是本库 Name2Id 的 rowid，先翻译回真实 username
                 sender_user = n2i.get(sender_id, "")
                 is_self = 1 if sender_user == me else 0
@@ -411,15 +425,25 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             fresh = []
             update = []
             for b in batch:
+                # 优先按 msg_id 认亲：mid 由 cid+local_id+ctime 算出，稳定不变
                 row = conn.execute(
-                    "SELECT msg_id, sender, sender_username, is_self FROM msg"
-                    " WHERE conv_id=? AND ts=? AND content=? LIMIT 1",
-                    (b[1], b[4], b[9])).fetchone()
+                    "SELECT msg_id, sender, sender_username, is_self"
+                    " FROM msg WHERE msg_id=?", (b[0],)).fetchone()
+                if not row:
+                    # 兼容另一条导入路径（JSON 导入的 mid 前缀不同）。
+                    # 兜底键**不含 content**：content 会被重算（剥离发送者前缀），
+                    # 拿新 content 去比对旧记录必然落空，那样会把同一条消息
+                    # 重复插一份（实测过一次，多出 39 万条）。
+                    row = conn.execute(
+                        "SELECT msg_id, sender, sender_username, is_self"
+                        " FROM msg WHERE conv_id=? AND ts=? AND sender=? AND is_self=?"
+                        " LIMIT 1",
+                        (b[1], b[4], b[6], b[7])).fetchone()
                 if row:
                     stats["skip_dup"] += 1
-                    # 老数据的 sender / is_self 是用错的 id 空间算出来的
-                    # （把 contact.db 的 id 当成了 Name2Id 的 rowid），
-                    # 所以这里整条重算，而不是只补空值
+                    # 老数据的 sender / is_self 用错了 id 空间，按正确映射重算；
+                    # content 不动——历史正文里的发送者前缀属于显示问题，
+                    # 为此重写 content 会破坏上面那个兜底键，得不偿失
                     if ((row[1] or "") != b[6] or (row[2] or "") != b[12]
                             or (row[3] or 0) != b[7]):
                         update.append((b[6], b[12], b[7], row[0]))
