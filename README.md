@@ -65,6 +65,14 @@ sudo docker compose -f docker-compose.single.yml up -d
 - 日志：`/data/logs/autosync.log`
 - `WV_AUTOSYNC=0` 可关闭；`WV_AUTOSYNC_POLL` / `WV_AUTOSYNC_STABLE` 调整节奏
 
+**页面也是自动更新的**：打开方舟页面后不用管，它每 20 秒查一次后端状态，
+有新消息会直接追加到当前会话底部（不会打断你正在翻看的历史）。
+端到端延迟约 1.5~3 分钟（微信落盘 + 同步 + 页面轮询叠加），嫌慢可把
+`WV_AUTOSYNC_POLL` 调到 20、`WV_AUTOSYNC_STABLE` 调到 10。
+想彻底关掉页面自动刷新：浏览器控制台执行 `localStorage.wv_autorefresh='0'` 再刷新。
+
+**非中国时区必须设 `WV_TZ_OFFSET`**（见 `env.example`），否则消息时间会整体偏移。
+
 **手动同步**（排查问题或立即触发）：
 
 ```bash
