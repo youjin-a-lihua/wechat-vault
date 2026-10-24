@@ -22,6 +22,18 @@
   而不是让用户对着「解密完成 0/24」或空结果猜。
 
 ### 修复
+- **发送者与己方角色判定错误（查错了 id 空间）**：`real_sender_id` 指向的是
+  message 库自己 `Name2Id` 的 rowid，**不是 contact.db 的 id**——实测自己的
+  `contact.id=85`，而在各 message 库的 `Name2Id` 里 `rowid=3`。原实现拿
+  contact.db 的 id 去查，等于查错了表。
+  后果：从微信库同步来的 55.9 万条消息里 `is_self=1` 的只有 145 条，
+  自己发的消息几乎全被当成对方发的，前端左右角色错位；`sender` 名字
+  靠消息体前缀兜底才勉强看着对，前缀缺失时直接显示数字 id。
+  修法：新增 `read_name2id()` 逐库翻译 sender_id → username，
+  `sender` 改为按 username 查备注/昵称，`is_self` 改为 `sender_user == 自己 wxid`；
+  `_self_wxid()` 正确提取账号目录里的真实 wxid（原 `split("_")[0]` 只拿到 `"wxid"`）。
+  已有记录整条重算（一次修正 1,371,823 条、43 秒），
+  全库 `is_self` 分布变为 66.5% 对方 / 33.5% 自己。
 - **前端最新消息不显示（消息列表按 `seq` 排序）**：`/api/messages` 用
   `ORDER BY seq` 分页，但库里混着两套互不相干的编号——JSON 导入的是文件内
   序号（实测 `0..6698`），微信库同步的是微信的 `local_id`（实测 `2..6156`），
