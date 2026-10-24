@@ -185,8 +185,28 @@ async def _auth_guard(req: Request, call_next):
     if path == "/healthz":
         return JSONResponse({"ok": True})
 
-    # 尚未初始化（未设密码且未跳过）→ 引导到设置页
-    if not AUTH["enabled"] and not AUTH["setup_skipped"]:
+    # autosync 从容器内 127.0.0.1 调 /api/reload。它没有登录态、不带 session
+    # cookie，一旦设置了访问密码就会拿到 401 —— 结果是媒体关联明明跑完了，
+    # 查看器还在用旧缓存，新消息的图片/表情永远不显示。
+    # 回环地址与容器同生共死，放行它不扩大攻击面；真正的入口仍由后面的
+    # 网段白名单和密码守着。
+    if path == "/api/reload" and _client_ip(req) in ("127.0.0.1", "::1"):
+        return await call_next(req)
+
+    # 尚未初始化：没设密码、也没跳过设置
+    uninitialized = (not AUTH["enabled"]) and (not AUTH["setup_skipped"])
+
+    # 网段白名单（配了才生效）—— 必须放在下面两个分支**之前**。
+    # 放在"认证关闭"之后的话，"跳过密码"模式会直接 return 放行，
+    # 白名单被整个绕过，配了也形同虚设。
+    if AUTH["allow_cidrs"] and not A.ip_in_any(_client_ip(req), AUTH["allow_cidrs"]):
+        # 未初始化时放行设置相关页面：否则管理员自己在陌生网段，
+        # 连设密码的入口都进不去，服务等于废了
+        if not (uninitialized and path in PUBLIC_PATHS):
+            return JSONResponse({"detail": "当前网络不在允许范围内"}, status_code=403)
+
+    # 尚未初始化 → 引导到设置页
+    if uninitialized:
         if path in PUBLIC_PATHS:
             return await call_next(req)
         if path.startswith("/api/"):
@@ -197,10 +217,6 @@ async def _auth_guard(req: Request, call_next):
     # 认证关闭（已跳过设置）→ 直通
     if not AUTH["enabled"]:
         return await call_next(req)
-
-    # 网段白名单（配了才生效）
-    if AUTH["allow_cidrs"] and not A.ip_in_any(_client_ip(req), AUTH["allow_cidrs"]):
-        return JSONResponse({"detail": "当前网络不在允许范围内"}, status_code=403)
 
     # 公开路径直通
     if path in PUBLIC_PATHS:
@@ -276,10 +292,29 @@ def api_logout():
     resp.delete_cookie(A.COOKIE_NAME, path="/")
     return resp
 
+def _check_origin(req: Request) -> bool:
+    """校验 Origin/Referer 与请求 Host 一致（防跨站提交）。
+
+    没有 Origin/Referer 时放行：非浏览器客户端（curl、脚本）本来就不带头，
+    它们的来源由网段白名单和密码负责；浏览器则必然带头。
+    """
+    origin = req.headers.get("origin") or req.headers.get("referer")
+    if not origin:
+        return True
+    host = req.headers.get("host") or ""
+    if not host:
+        return False
+    return origin.startswith("http://" + host) or origin.startswith("https://" + host)
+
+
 @app.post("/api/setup")
 async def api_setup(req: Request):
     """首次初始化：设置管理员密码。仅未初始化时可用。"""
-    if AUTH["enabled"]:
+    if not _check_origin(req):
+        return JSONResponse({"detail": "请求来源不允许"}, status_code=403)
+    # 跳过密码也算"已初始化"——否则跳过之后任何人都能再来设一次密码，
+    # 等于把接管窗口永久敞开
+    if AUTH["enabled"] or AUTH["setup_skipped"]:
         return JSONResponse({"detail": "已设置过密码"}, status_code=409)
     try:
         body = await req.json()
@@ -306,9 +341,12 @@ async def api_setup(req: Request):
     return resp
 
 @app.post("/api/setup/skip")
-async def api_setup_skip():
+async def api_setup_skip(req: Request):
     """跳过首次设置：保持无密码直进（本机/可信网络零摩擦）。"""
-    if AUTH["enabled"]:
+    if not _check_origin(req):
+        return JSONResponse({"detail": "请求来源不允许"}, status_code=403)
+    # 已设密码就不能再"跳过"覆盖掉；已跳过也不重复写
+    if AUTH["enabled"] or AUTH["setup_skipped"]:
         return JSONResponse({"detail": "已设置过密码"}, status_code=409)
     try:
         data = {}
@@ -1046,7 +1084,10 @@ def api_locate(
             (conv_id, lo, lo + 86400)).fetchone()[0]
         row = conn.execute(
             "SELECT seq, ts, msg_id FROM msg WHERE conv_id=? AND ts>=?"
-            " ORDER BY ts, seq LIMIT 1",
+            # 排序口径必须和 /api/messages 完全一致（ts, seq, msg_id）。
+            # 少一个 msg_id 时，同秒多条的场景下这里选中的"当天第一条"
+            # 和前端列表里的第一条可能不是同一条，回填下标就错位。
+            " ORDER BY ts, seq, msg_id LIMIT 1",
             (conv_id, lo)).fetchone()
         if not row:
             return {"date": day, "found": False, "total": total,

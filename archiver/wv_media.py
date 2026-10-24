@@ -453,11 +453,15 @@ def _plain_media_meta(plain_dbs: str) -> tuple[dict, dict]:
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name LIKE 'Msg\\_%' ESCAPE '\\'")]
             for t in tabs:
+                # 表名拼进 SQL：形态校验 + 双引号包裹（同 run_emoji）
+                if not re.fullmatch(r"Msg_[0-9a-f]{32}", t):
+                    log.warning("跳过形态异常的消息表名：%r", t)
+                    continue
                 h = t[4:]
                 try:
                     rows = c.execute(
-                        "SELECT create_time, message_content FROM %s "
-                        "WHERE local_type=3" % t).fetchall()
+                        'SELECT create_time, message_content FROM "%s" '
+                        'WHERE local_type=3' % t).fetchall()
                 except sqlite3.Error as e:
                     log.warning("读取明文库失败，该会话尺寸信息缺失（会拉低关联命中率）：%s", e)
                     continue
@@ -901,6 +905,34 @@ def run_voice(plain_dbs: str, vault: str, out: str) -> dict:
     print("  语音关联：%d / %d" % (len(upd), len(vrows)))
     return {"voice": len(vrows), "decoded": ok, "linked": len(upd)}
 
+def _safe_emoji_md5(md5: str) -> str:
+    """表情 md5 只接受 32 位十六进制。
+
+    它同时充当下载后的文件名和 vault 里的关联键，而来源是消息体 XML——
+    **给对方完全可控**。不校验的话 `../../foo` 这种形态会经
+    `os.path.join(edir, md5 + ext)` 穿越出 emoji 目录（`open()` 甚至会
+    顺手把中间目录建出来），把任意下载内容写到媒体目录之外。
+    """
+    return md5 if re.fullmatch(r"[0-9a-fA-F]{32}", md5) else ""
+
+
+def _safe_http_url(u: str) -> str:
+    """表情 CDN URL 只允许 http/https。
+
+    同样来自消息 XML。不做 scheme 白名单时，`file:///data/auth.json`
+    会被 `urlopen` 照单全收：本地文件被读出来后写进 emoji 目录，
+    再由 `/media/emoji/...` 原样吐出——等于把密钥文件变成可下载资源。
+    顺带也能打内网 HTTP 服务做 SSRF。
+    """
+    try:
+        p = urllib.parse.urlparse(u)
+    except ValueError:
+        return ""
+    if p.scheme not in ("http", "https") or not p.netloc:
+        return ""
+    return u
+
+
 def run_emoji(plain_dbs: str, vault: str, out: str,
               limit: int = 6000, workers: int = 8) -> dict:
     """表情包（动画表情）：本地不缓存 → 从消息 XML 自带的 cdnurl 下载补齐。
@@ -913,7 +945,7 @@ def run_emoji(plain_dbs: str, vault: str, out: str,
     为控制体积与请求量，只下载**出现频次最高的前 limit 个**表情
     （表情包复用率极高，Top 数千即可覆盖绝大多数消息）。
     """
-    import urllib.request
+    import urllib.parse, urllib.request
     from concurrent.futures import ThreadPoolExecutor
 
     zb = zstd.ZstdDecompressor()
@@ -936,10 +968,16 @@ def run_emoji(plain_dbs: str, vault: str, out: str,
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name LIKE 'Msg\\_%' ESCAPE '\\'")]
             for t in tabs:
+                # 表名要拼进 SQL。sqlite_master 里的名字本身来自库文件，
+                # 但库文件可能是外部导入/受损的，所以仍按已知形态校验，
+                # 并用双引号包裹作双保险。
+                if not re.fullmatch(r"Msg_[0-9a-f]{32}", t):
+                    log.warning("跳过形态异常的消息表名：%r", t)
+                    continue
                 h = t[4:]
                 try:
-                    rows = c.execute("SELECT create_time, message_content FROM %s "
-                                     "WHERE local_type=47" % t).fetchall()
+                    rows = c.execute('SELECT create_time, message_content FROM "%s" '
+                                     'WHERE local_type=47' % t).fetchall()
                 except sqlite3.Error as e:
                     log.warning("读取表情库失败，该库表情无法关联：%s", e)
                     continue
@@ -948,12 +986,13 @@ def run_emoji(plain_dbs: str, vault: str, out: str,
                     if not m:
                         continue
                     a = dict(re.findall(rb'([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"', m.group(1)))
-                    md5 = a.get(b"md5", b"").decode()
+                    md5 = _safe_emoji_md5(a.get(b"md5", b"").decode())
                     if not md5:
                         continue
                     ct2md5[(h, ct)] = md5
                     freq[md5] = freq.get(md5, 0) + 1
-                    u = a.get(b"cdnurl", b"").decode().replace("&amp;", "&")
+                    u = _safe_http_url(
+                        a.get(b"cdnurl", b"").decode().replace("&amp;", "&"))
                     if u:
                         url.setdefault(md5, u)
             c.close()

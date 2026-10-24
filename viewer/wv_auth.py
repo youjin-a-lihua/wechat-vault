@@ -149,21 +149,31 @@ def _parse_cidr(cidr: str) -> tuple[int, int] | None:
         return None
 
 def ip_in_any(ip: str, cidrs: Iterable[str]) -> bool:
-    """判断 IP 是否落在任一台网内。IPv6 或解析失败一律放行（交给密码管）。"""
+    """判断 IP 是否落在任一台网内。
+
+    注意「解析失败/格式不认识」的默认方向：这里选**拒绝**（return False），
+    而不是放行。原因是白名单一旦配上，就意味着"只信这些网段"；
+    遇到看不懂的地址却放行，等于给所有异常来源开后门。
+    """
     nets = [n for n in (_parse_cidr(c) for c in cidrs) if n]
     if not nets:
         return True                       # 没配白名单 = 不限制网段
-    if ":" in ip:                         # IPv6 不做网段判定（简化）
-        return True
+    if not ip:
+        return False
+    if ":" in ip:
+        # 白名单目前只解析 IPv4 网段。IPv6 客户端一律视为不在白名单——
+        # 不能图省事 return True，那等于让所有 v6 来源绕过限制。
+        # 真需要放行 v6，请在 WV_ALLOW_CIDRS 里配 IPv6 网段（届时扩展 _parse_cidr）。
+        return False
     try:
         octets = [int(x) for x in ip.split(".")]
         if len(octets) != 4:
-            return True
+            return False
         v = 0
         for o in octets:
             v = (v << 8) | o
     except (ValueError, IndexError):
-        return True
+        return False
     return any((v & mask) == net for net, mask in nets)
 
 def gen_secret() -> str:
