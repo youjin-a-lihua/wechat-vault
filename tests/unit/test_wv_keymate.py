@@ -269,7 +269,7 @@ class TestPrivateHost(unittest.TestCase):
     """绝不开公网：私网白名单放行/拒绝。"""
 
     def test_private_allowed(self):
-        for host in ("192.168.1.10", "10.0.0.5", "172.16.0.1", "172.31.255.255",
+        for host in ("192.168.1.10", "10.0.0.5", "172.16.0.1", "172.31.255.255",  # preflight-allow
                      "127.0.0.1", "localhost", "127.1.2.3"):
             self.assertTrue(K.is_private_host(host), host)
 
@@ -283,7 +283,7 @@ class TestPrivateHost(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             K.ensure_private_host("8.8.8.8")
         self.assertIn("绝不开公网", str(ctx.exception))
-        self.assertEqual(K.ensure_private_host("192.168.0.1"), "192.168.0.1")
+        self.assertEqual(K.ensure_private_host("192.168.0.1"), "192.168.0.1")  # preflight-allow
 
     def test_deliver_and_trigger_refuse_public(self):
         """投递/触发同步的入口必须在动网络前就拒绝公网目标。"""
