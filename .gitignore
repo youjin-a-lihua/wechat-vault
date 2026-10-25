@@ -8,6 +8,8 @@
 
 # ── ① 凭据 / 密钥（最高优先级：泄漏即不可逆）──────────────────
 local_keys/
+# 密钥管家插件的输出目录（WV_KEYMATE_OUT，含 passphrase.json / all_keys.json）
+keymate_out/
 *_pwhash.txt
 .preflight-denylist
 *.pem

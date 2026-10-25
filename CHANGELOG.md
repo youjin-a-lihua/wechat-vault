@@ -3,6 +3,57 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.3] - 2026-10-25
+
+### 新增
+- **密钥管家插件 `plugins/wv-keymate/`**：把「已拿到微信密钥」之后的十分钟变成
+  确定性体验——校验 → 规范化 → 投递 NAS → 触发同步。
+  - `keymate.py` 主入口（`run` 一条龙，也可拆 `import/verify/deliver/trigger`）；
+    纯 stdlib，仅解密校验可选依赖 pycryptodome
+  - `extract_scan.py` 路线 A：内存扫描 + 捕获窗口（≤50ms 高频轮询），适用旧版微信
+  - `extract_dump.py` 路线 B：**用文档化 `MiniDumpWriteDump` 只读快照 + 离线扫描**
+    覆盖新版微信（4.0.3.39+ 密钥用完即释放，瞬时扫描来不及）。**不注入、不改动
+    微信进程**——这是刻意的合规设计：注入类工具正是 2026-01 DMCA 清理的靶心，
+    而 Minidump 是所有崩溃报告器都用的公开 API，权限需求与扫描相同
+  - `drop.ps1` 一键投递（私网白名单 + robocopy + 触发 ingest）
+  - 安全：私网白名单（192.168/10/172.16/127）拒绝公网；日志只露密钥前 6 位；
+    无硬编码路径/盘符/真实 IP；仓库零 hook/DLL 注入代码
+  - 24 项单测覆盖契约往返、96hex 兼容切分、解密裁判正反例、私网白名单
+
+### 修复
+- **G1 `all_keys.json` 格式断点**：`load_keys` 原来把 96hex 拼接串当 enc_key 取出，
+  而 `decrypt_one` 只收 64hex 直接拒——工具产出的密钥根本喂不进去。
+  新增 `_norm_key_entry` 规约器，三种形态自动分流：96hex 拼接切开 / 纯 64hex /
+  dict `{enc_key, salt}`（含 dict 里误写 96hex 的防御性切分）。
+- **G2 passphrase 覆盖不了未登记的库（阻断无感续用）**：`decrypt_all` 原来只解
+  `all_keys.json` 里登记过的库，微信日后新增 `message_N.db` 被**静默跳过**——
+  「任意库可派生」的承诺落空。现在有 passphrase 时未登记库照常派生解密。
+  实测价值：24 库里 `message_resource.db` 被微信重建过（salt 变了），
+  all_keys 快照密钥已失效，正是靠 passphrase 兜住的。
+- **G3 必须有 `all_keys.json` 才能启动**：新增 `load_key_material()`，
+  `passphrase.json` 可用时 keys 文件缺失/为空照常启动；两者皆无才报错。
+- **密钥校验的假阴性（历史「扫描 0 命中」的真实原因）**：`wv_winkey.py` /
+  `wv_keymem.py` 的 HMAC 公式与实证正确的 `wv_sync` 不一致——
+  轮数写成 256000（应为 2）、salt 漏 XOR 0x3A。用生产库真密钥做对照实验：
+  两个旧公式都会**把真密钥判为无效**，只有正确公式通过。
+  即「扫到了候选、却被错误的尺子否决」。
+  现已弃 HMAC 猜谜，改为**解密裁判**（按 SQLCipher 4 页模型真解 page 0 验
+  SQLite 头，`full=True` 时全文件解密后 `sqlite3` 试开），以实证解密器为唯一裁判。
+  另注：HMAC 输入须含小端页号（`tools/wv_wxdb.py:187`）。
+- `wv_winkey.py` 三处顺带修复：`_PROBE_CTX` 在 Windows spawn 子进程里为空导致
+  并行校验永远退回单进程（改 `ProcessPoolExecutor` initializer 传参）；
+  硬编码个人安装路径改走 `--db-dir`/`WV_DB_DIR`/`WV_WECHAT_FILES`；
+  日志泄漏 master key 改为只露前 32 字符 + 尾 salt。
+
+### 变更
+- **主 README「密钥从哪来」重写**为三步决策树（取/交/用），指向 `plugins/wv-keymate/`。
+  明确写清：微信 4.0.3.39（Win）/ 4.0.3.88（Mac）起 dbkey 用完即释放，瞬时扫描易扑空，
+  所以**首选降级取钥**（临时装 ≤4.0.3.36 取一次，密钥大版本内通用）；
+  Docker 容器内取不了密钥，取钥必须在 Windows 宿主机侧做。
+  注入类工具的风险（账号风控 + DMCA）如实告知，本项目不内置、不代跑、不给下载指向。
+
+---
+
 ## [0.3.2] - 2026-10-25
 
 ### 变更（破坏性：会话键改了）
