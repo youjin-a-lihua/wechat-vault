@@ -303,10 +303,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     sender_username 是后加的：老库只有 sender（显示名），而显示名会重名
     （实测 4933 个联系人里有 199 组同名），前端拿它查头像必然串。新库直接建出来，
     老库由 migrate_schema 补列、由回填逻辑补数据。
+
+    **顺序很重要**：`CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，所以老库
+    跑完建表语句后依然没有新列；此时若接着跑 `CREATE INDEX ... ON conv(account,
+    username)` 就会 `no such column: username`，整个同步直接崩。必须先补列、再建
+    索引——`wv_archiver.migrate_schema` 里为同一件事写过这条注释，这里是第二次踩。
     """
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS conv (
         conv_id TEXT PRIMARY KEY, account TEXT DEFAULT '', title TEXT,
+        -- username = wxid / xxx@chatroom，会话的**稳定身份**（conv_id 的键）。
+        -- title 是显示名，随时会变，绝不能拿来当键。
+        username TEXT DEFAULT '',
         is_group INTEGER DEFAULT 0, members TEXT DEFAULT '[]',
         n_msg INTEGER DEFAULT 0, start_ts INTEGER, end_ts INTEGER,
         sources TEXT DEFAULT '[]', created_at INTEGER, updated_at INTEGER
@@ -317,6 +325,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         type TEXT, content TEXT, media TEXT, media_full TEXT,
         source_file TEXT, created_at INTEGER, sender_username TEXT DEFAULT ''
     );
+    """)
+    # 老库补列（CREATE TABLE IF NOT EXISTS 对已存在的表不生效）—— 必须在建索引之前
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(msg)")}
+    if "sender_username" not in cols:
+        conn.execute("ALTER TABLE msg ADD COLUMN sender_username TEXT DEFAULT ''")
+    ccols = {r[1] for r in conn.execute("PRAGMA table_info(conv)")}
+    if "username" not in ccols:
+        # 老库的 conv_id 是 account::显示名，username 列还没建；
+        # 建出来后由 migrate_conv_keys 逐条认领（填了 username 才算迁完）
+        conn.execute("ALTER TABLE conv ADD COLUMN username TEXT DEFAULT ''")
+
+    conn.executescript("""
     CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts);
     -- 覆盖 /api/messages 的完整排序键：只有 (conv_id, ts) 时，
     -- ts 之后的 seq/msg_id 两个排序键要走 TEMP B-TREE，
@@ -327,11 +347,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_msg_type ON msg(type);
     CREATE INDEX IF NOT EXISTS idx_msg_account ON msg(account);
     CREATE INDEX IF NOT EXISTS idx_conv_account ON conv(account);
+    -- conv.username：会话的**稳定身份**（wxid / xxx@chatroom）。
+    -- conv_id 的键就是它，显示名只是 conv.title 里的一个可变字段。
+    CREATE INDEX IF NOT EXISTS idx_conv_username ON conv(account, username);
     """)
+    # 全文索引：同步链路自己建的库（没走过 wv_archiver 的导入路径）以前**没有**
+    # msg_fts，于是 /api/search 永远走 LIKE 全表扫描 —— 189 万行上敲一个词
+    # 就是一次全库扫。建出来，由 ensure_fts 负责补齐内容。
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5("
+        "content, sender, conv_id UNINDEXED, msg_id UNINDEXED, "
+        "account UNINDEXED, tokenize='trigram')")
     # 老库补列（CREATE TABLE IF NOT EXISTS 对已存在的表不生效）
     cols = {r[1] for r in conn.execute("PRAGMA table_info(msg)")}
     if "sender_username" not in cols:
         conn.execute("ALTER TABLE msg ADD COLUMN sender_username TEXT DEFAULT ''")
+    ccols = {r[1] for r in conn.execute("PRAGMA table_info(conv)")}
+    if "username" not in ccols:
+        # 老库的 conv_id 是 account::显示名，username 列还没建；
+        # 建出来后由 migrate_conv_keys 逐条认领（填了 username 才算迁完）
+        conn.execute("ALTER TABLE conv ADD COLUMN username TEXT DEFAULT ''")
 
 def read_name2id(msg_db: Path) -> dict[int, str]:
     """message 库自己的 id → username。
@@ -357,6 +392,195 @@ def read_name2id(msg_db: Path) -> dict[int, str]:
     return out
 
 
+# 参与全文索引的消息类型（与 wv_archiver 的口径一致）
+FTS_TYPES = ("text", "link", "system", "other")
+
+def rebuild_fts(conn: sqlite3.Connection) -> int:
+    """整体重建全文索引，返回写入行数。
+
+    只在"msg_id 被批量改写过"（会话键迁移）之后调用：那种情况下旧索引里的
+    msg_id 全部失效，逐行改不如整表重建。索引从 msg 全量回填，不丢内容。
+    """
+    n = conn.execute(
+        "SELECT COUNT(*) FROM msg WHERE type IN (%s)"
+        " AND COALESCE(content,'')<>''" % ",".join("?" * len(FTS_TYPES)),
+        FTS_TYPES).fetchone()[0]
+    conn.execute("DROP TABLE IF EXISTS msg_fts")
+    conn.execute(
+        "CREATE VIRTUAL TABLE msg_fts USING fts5("
+        "content, sender, conv_id UNINDEXED, msg_id UNINDEXED, "
+        "account UNINDEXED, tokenize='trigram')")
+    conn.execute(
+        "INSERT INTO msg_fts (content, sender, conv_id, msg_id, account) "
+        "SELECT content, sender, conv_id, msg_id, COALESCE(account,'') FROM msg "
+        "WHERE type IN (%s) AND COALESCE(content,'')<>''"
+        % ",".join("?" * len(FTS_TYPES)), FTS_TYPES)
+    log.info("全文索引已整体重建：%d 条", n)
+    return n
+
+def ensure_fts(conn: sqlite3.Connection) -> int:
+    """补齐缺失的全文索引行，返回补了几条。
+
+    为什么需要它：FTS 不是"建了就有"——只有走过写入路径的消息才会进索引。
+    实测这套库里 msg_fts 有 93.7 万行、而可索引消息有 117 万行，差 23 万：
+    那些消息搜不到，而前端不会提示"索引不全"，只会表现为"我记得有这条，
+    搜不出来"。
+
+    做法是先建一张临时表存已有 msg_id（带主键索引），再用 NOT IN 补缺的。
+    直接用 `WHERE msg_id NOT IN (SELECT msg_id FROM msg_fts)` 不行 ——
+    FTS5 表的列是 UNINDEXED，那个子查询会退化成逐行扫全表，O(n²)。
+
+    幂等：补完再跑就是 0 条。
+    """
+    try:
+        need = conn.execute(
+            "SELECT COUNT(*) FROM msg WHERE type IN (%s)"
+            " AND COALESCE(content,'')<>''" % ",".join("?" * len(FTS_TYPES)),
+            FTS_TYPES).fetchone()[0]
+        have = conn.execute("SELECT COUNT(*) FROM msg_fts").fetchone()[0]
+    except sqlite3.Error as e:
+        log.warning("全文索引检查失败，本轮跳过：%s", e)
+        return 0
+    if have >= need:
+        return 0
+
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _fts_have"
+                 "(msg_id TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _fts_have")
+    conn.execute("INSERT INTO _fts_have SELECT msg_id FROM msg_fts")
+    cur = conn.execute(
+        "INSERT INTO msg_fts (content, sender, conv_id, msg_id, account) "
+        "SELECT m.content, m.sender, m.conv_id, m.msg_id, COALESCE(m.account,'') "
+        "FROM msg m WHERE m.type IN (%s) AND COALESCE(m.content,'')<>'' "
+        "AND m.msg_id NOT IN (SELECT msg_id FROM _fts_have)"
+        % ",".join("?" * len(FTS_TYPES)), FTS_TYPES)
+    conn.execute("DROP TABLE IF EXISTS _fts_have")
+    n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else (need - have)
+    log.info("全文索引补齐：%d 条（索引 %d → 目标 %d）", n, have, need)
+    return n
+
+def _stable_cid(account_name: str, username: str) -> str:
+    """会话 ID：**account::username**，不用显示名。
+
+    原来这里是 `account::显示名`（备注/昵称/群名）。显示名是会变的——
+    对方改个备注、群里改个名，下一次同步就会算出一个"新"的 conv_id，
+    于是：会话在列表里分裂成两条，而 msg_id 又是拿 conv_id 算的，
+    整段历史被当成新消息重新插一遍（重复 + 条数虚高）。
+    username（wxid / xxx@chatroom）在微信侧是不变的，拿它做键才对。
+    显示名照旧存 conv.title，改了就改 title，不碰键。
+    """
+    return "%s::%s" % (account_name, username)
+
+def _recompute_mid(cid: str, local_id, ctime) -> str:
+    """按 msg_id 的既定公式重算（迁移改名时用）。"""
+    return MSG_PREFIX + hashlib.sha1(
+        ("%s|%s|%s" % (cid, local_id, ctime)).encode()).hexdigest()[:12]
+
+def migrate_conv_keys(conn: sqlite3.Connection, account_name: str,
+                      title_map: dict[str, set[str]]) -> dict:
+    """把老库里 `account::显示名` 的会话键迁到 `account::username`。
+
+    只在**同步时能拿到 ground truth** 的地方做：title_map 是本次同步逐个
+    username 算出来的「显示名 → username 集合」，比反过来猜可靠得多。
+
+    迁移要动三样东西，少一样就会留下暗坑：
+      1. conv.conv_id      —— 键本身
+      2. msg.conv_id       —— 消息跟着走
+      3. msg.msg_id        —— 它是拿 conv_id 算的，不改的话下一轮所有消息
+                              都"认不出自己"，全部走兜底去重（每轮多 137 万次查询）
+
+    只重写 `db-` 前缀的 msg_id（同步链路自己算的）。`json-` 那条是导入链路
+    按文件算的，反推不出原始字段，保持不动——它们的 conv_id 照样跟着迁，
+    位置不会错。
+
+    返回统计；跳过（显示名重名且无法判定）的会话原样留着，不猜。
+    """
+    stats = {"conv": 0, "msg": 0, "skip": 0, "renamed": 0, "stuck": {},
+             "legacy": 0}
+    legacy = conn.execute(
+        "SELECT conv_id, title FROM conv WHERE account=?"
+        " AND COALESCE(username,'')=''", (account_name,)).fetchall()
+    if not legacy:
+        return stats
+
+    for conv_id, title in legacy:
+        # 键里那半截才是建库时的显示名（title 可能后来被改过）
+        key = conv_id.split("::", 1)[-1] if "::" in conv_id else conv_id
+        cands = set(title_map.get(key, ())) | set(title_map.get(title or "", ()))
+        username = ""
+        if len(cands) == 1:
+            username = next(iter(cands))
+        elif len(cands) > 1:
+            # 显示名撞车（实测 4933 个联系人里 199 组同名）：拿这个会话里
+            # 出现过的 sender_username 去认人。群聊的 sender 是成员而非群号，
+            # 认不出来就宁可不迁——留着老键只是"改了名会分裂"，猜错就是真错。
+            who = {r[0] for r in conn.execute(
+                "SELECT DISTINCT sender_username FROM msg WHERE conv_id=?"
+                " AND COALESCE(sender_username,'')<>''", (conv_id,))}
+            hit = [u for u in cands if u in who]
+            if len(hit) == 1:
+                username = hit[0]
+        if not username:
+            stats["skip"] += 1
+            if len(cands) > 1:
+                log.warning("显示名 %r 对应多个会话且无法判定，跳过迁移：%s",
+                            key, conv_id)
+                # 记下来交给同步主循环：这类会话继续沿用老键，
+                # 不去新建 account::username —— 否则同名两人的历史会各自
+                # 再插一遍（msg_id 跟着 cid 变），凭空多出上万条重复。
+                stats["stuck"][key] = conv_id
+                stats["stuck"].setdefault(title or "", conv_id)
+            else:
+                # 零候选是另一种情况：这个显示名在**当前微信号里根本不存在**。
+                # 实测 12 个全是 JSON 导入遗留的历史会话（微信那边早就没了，
+                # 或本来就不是这个号的），其中 10 个零候选、2 个歧义。
+                # 这类会话的 msg_id 清一色是 json- 前缀，本轮同步不会碰它们，
+                # 所以"保持老键"没有分裂风险——它不是失败，是无法归属。
+                stats["legacy"] += 1
+            continue
+
+        new_cid = _stable_cid(account_name, username)
+        if new_cid == conv_id:
+            conn.execute("UPDATE conv SET username=? WHERE conv_id=?",
+                         (username, conv_id))
+            stats["conv"] += 1
+            continue
+
+        rows = conn.execute(
+            "SELECT msg_id, seq, ts FROM msg WHERE conv_id=?", (conv_id,)).fetchall()
+        rebind = []
+        for mid, seq, ts in rows:
+            new_mid = (_recompute_mid(new_cid, seq, ts)
+                       if (mid or "").startswith(MSG_PREFIX) else mid)
+            rebind.append((new_cid, new_mid, mid))
+        # OR IGNORE：新 msg_id 撞上已存在的行（同一条消息之前已经被写进
+        # 新键了）时跳过，那些重复的由下面的 DELETE 收掉
+        conn.executemany(
+            "UPDATE OR IGNORE msg SET conv_id=?, msg_id=? WHERE msg_id=?", rebind)
+        stats["msg"] += len(rebind)
+        # 全文索引**不在这里跟随**：FTS5 的列是 UNINDEXED，逐行改 189 万条
+        # 等于每行全表扫一次。改完由调用方整体重建一次（见 rebuild_fts）。
+        conn.execute("DELETE FROM msg WHERE conv_id=?", (conv_id,))
+        stats["renamed"] += 1
+
+        exists = conn.execute("SELECT 1 FROM conv WHERE conv_id=?", (new_cid,)).fetchone()
+        if exists:
+            # 新老键同时存在（比如别的路径已经按新键建过）：合并，删掉老行
+            conn.execute("DELETE FROM conv WHERE conv_id=?", (conv_id,))
+        else:
+            conn.execute("UPDATE conv SET conv_id=?, username=? WHERE conv_id=?",
+                         (new_cid, username, conv_id))
+        # 条数以实际消息数为准，别沿用累加出来的旧值
+        conn.execute(
+            "UPDATE conv SET n_msg=(SELECT COUNT(*) FROM msg WHERE conv_id=?)"
+            " WHERE conv_id=?", (new_cid, new_cid))
+        stats["conv"] += 1
+
+    if stats["conv"]:
+        log.info("会话键迁移（显示名 → username）：会话 %d 个、消息 %d 条、跳过 %d 个",
+                 stats["conv"], stats["msg"], stats["skip"])
+    return stats
+
 def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
                   since_ts: int = 0, limit_tables: int = 0,
                   self_wxid: str = "") -> dict:
@@ -374,6 +598,24 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
     conn.execute("PRAGMA journal_mode=WAL")
 
     stats = {"conv": 0, "msg": 0, "skip_dup": 0, "tables": 0, "backfill": 0}
+    # 先把「显示名 → username」这张表建出来（迁移要用，且只有这里能算准），
+    # 再在真正写数据之前把老键迁过去。
+    # 这里必须 O(n)：_display_title 每调一次都要遍历全部联系人，
+    # 逐个 session 调就是 会话数 × 联系人数（几千 × 几千）次比较。
+    title_map: dict[str, set[str]] = {}
+    for u in sessions:
+        v = by_user.get(u)
+        t = ((v.get("remark") or v.get("nick")) if v else "") or sessions.get(u, u)
+        title_map.setdefault(t, set()).add(u)
+    stats["migrate"] = migrate_conv_keys(conn, account_name, title_map)
+    # 迁移改写了 msg_id → 旧索引整批失效，必须重建（否则每条搜索结果
+    # 都指向已经不存在的 msg_id）。这是**一次性**的：以后没有迁移就不跑。
+    if stats["migrate"].get("renamed"):
+        try:
+            stats["fts_rebuilt"] = rebuild_fts(conn)
+        except sqlite3.Error as e:
+            log.warning("全文索引重建失败（不影响消息入库，搜索暂时回落 LIKE）：%s", e)
+
     msg_db = plain / "message"
     files = sorted(msg_db.glob("message_[0-9]*.db")) if msg_db.is_dir() else []
     if limit_tables:
@@ -415,7 +657,11 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             if not username:
                 continue
             ctitle = _display_title(username, contacts, sessions)
-            cid = "%s::%s" % (account_name, ctitle)
+            # 同名撞车且判定不了的会话：继续用老键（保持合并现状），
+            # 不去新建 account::username —— 见 migrate_conv_keys 里的说明
+            stuck = stats["migrate"].get("stuck", {})
+            cid = stuck.get(ctitle) or _stable_cid(account_name, username)
+            conv_username = "" if ctitle in stuck else username
             stats["tables"] += 1
 
             # 表名要拼进 SQL：按已知形态校验 + 双引号包裹，双保险
@@ -513,17 +759,27 @@ def sync_messages(plain: Path, vault: Path, account_name: str = DEFAULT_ACCOUNT,
             ts_list = [b[4] for b in batch]
             is_group = 1 if username.endswith("@chatroom") else 0
             conn.execute(
-                "INSERT INTO conv (conv_id, account, title, is_group, n_msg, start_ts, end_ts,"
-                " sources, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+                "INSERT INTO conv (conv_id, account, title, username, is_group, n_msg,"
+                " start_ts, end_ts, sources, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(conv_id) DO UPDATE SET"
                 "   n_msg = n_msg + excluded.n_msg,"
+                "   title = excluded.title,"          # 改备注/改群名 → 只改显示名
+                "   username = excluded.username,"    # 老库认领：补上稳定身份
                 "   start_ts = MIN(COALESCE(conv.start_ts, excluded.start_ts), excluded.start_ts),"
                 "   end_ts = MAX(COALESCE(conv.end_ts, excluded.end_ts), excluded.end_ts),"
                 "   updated_at = excluded.updated_at",
-                (cid, account_name, ctitle, is_group, len(fresh),
+                (cid, account_name, ctitle, conv_username, is_group, len(fresh),
                  min(ts_list), max(ts_list), json.dumps([str(f)]), now, now))
             stats["conv"] = conn.execute("SELECT COUNT(*) FROM conv").fetchone()[0]
         c.close()
+
+    # 补齐历史遗留的索引缺口（新消息/老消息都在这里入索引，一处搞定）。
+    # 放在迁移之后：迁移会重写 msg_id，索引必须跟着改完再补，否则补的是旧 id。
+    try:
+        stats["fts"] = ensure_fts(conn)
+    except sqlite3.Error as e:
+        log.warning("全文索引补齐失败（不影响消息入库）：%s", e)
 
     conn.commit()
     conn.close()

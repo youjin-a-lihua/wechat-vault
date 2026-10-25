@@ -233,9 +233,12 @@ CREATE TABLE IF NOT EXISTS account (
 
 -- 会话
 CREATE TABLE IF NOT EXISTS conv (
-    conv_id     TEXT PRIMARY KEY,   -- 全局唯一：account::title
+    conv_id     TEXT PRIMARY KEY,   -- 全局唯一：account::username（同步链路）
+                                    -- 导入链路拿不到 username，仍按 account::标题，
+                                    -- 但会先反查已有会话，能合就合（见 _resolve_cid）
     account     TEXT DEFAULT '',    -- 所属微信号
-    title       TEXT,               -- 会话名（原始）
+    title       TEXT,               -- 会话名（原始，可变；不是键）
+    username    TEXT DEFAULT '',    -- 稳定身份 wxid / xxx@chatroom；空=老键未认领
     is_group    INTEGER DEFAULT 0,
     members     TEXT DEFAULT '[]',
     n_msg       INTEGER DEFAULT 0,
@@ -346,6 +349,9 @@ def migrate_schema(conn: sqlite3.Connection, verbose: bool = False) -> list[str]
     add_col("conv", "account", "TEXT DEFAULT ''")
     add_col("msg", "account", "TEXT DEFAULT ''")
     add_col("msg", "sender_username", "TEXT DEFAULT ''")
+    # 与 wv_sync 保持一致：username 是会话的稳定身份，导入链路填不了，
+    # 但列得在，否则同步链路写 conv 时会 no such column
+    add_col("conv", "username", "TEXT DEFAULT ''")
 
     fts_cols = cols("msg_fts")
     if fts_cols and "account" not in fts_cols:
@@ -507,6 +513,24 @@ def refresh_account(conn: sqlite3.Connection, account: str) -> None:
         (account, account, row["c"], row["m"], row["a"], row["b"]),
     )
 
+def _resolve_cid(conn: sqlite3.Connection, account: str, raw_cid: str) -> str:
+    """导入链路的会话键：优先并入已有会话，否则仍是 account::原标题。
+
+    同步链路（wv_sync）已经改用 `account::username`（wxid 不变，改备注也不会
+    分裂）。导入链路只有文件名，没有 username，算不出同样的键——如果各算各的，
+    同一段关系就会在列表里出现两条。所以这里先按「账号 + 标题/username」反查：
+    查到就并入那条（导出的消息自然和同步来的消息待在同一个会话里），
+    查不到再退回老规则。
+    """
+    try:
+        r = conn.execute(
+            "SELECT conv_id FROM conv WHERE account=? AND COALESCE(username,'')<>''"
+            " AND (title=? OR username=?) LIMIT 1",
+            (account, raw_cid, raw_cid)).fetchone()
+    except sqlite3.Error:
+        return f"{account}::{raw_cid}"
+    return r["conv_id"] if r else f"{account}::{raw_cid}"
+
 def import_file(conn: sqlite3.Connection, path: Path, verbose: bool = True,
                 source_root: Path | None = None) -> dict:
     """
@@ -545,7 +569,7 @@ def import_file(conn: sqlite3.Connection, path: Path, verbose: bool = True,
     # 会话 ID 全局唯一化：account::原标题。
     # 不同微信号可能有同名好友/同名群，不加前缀就会互相覆盖。
     raw_cid = conv["conv_id"]
-    cid = f"{account}::{raw_cid}"
+    cid = _resolve_cid(conn, account, raw_cid)
 
     # 为媒体解码器标注源文件目录（相对 media 路径的解析基准）
     for m in msgs:

@@ -62,6 +62,9 @@ from Crypto.Cipher import AES
 import zstandard as zstd
 import logging
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wv_io  # noqa: E402  原子落盘（索引文件写到一半被 kill 会整份失效）
+
 log = logging.getLogger(__name__)
 
 # 时区偏移（小时）：默认东八区。微信按本地时间分库（message_YYYY-MM.db），
@@ -414,8 +417,9 @@ def run_decode(attach: str, out: str, aes_key: bytes, xor_key: int,
     print("  完成 %.1fs：%s" % (time.time() - t0, dict(stats)))
     idx = {"sizemap": {"%s|%s|%d" % k: v for k, v in sizemap.items()},
            "md5map": md5map}
-    with open(os.path.join(out, "_index.json"), "w", encoding="utf-8") as f:
-        json.dump(idx, f)
+    # 原子写：这个文件常被写到 10 MB 级，写到一半被 kill 就留下截断的 JSON，
+    # 下次启动整份索引失效（表现为"媒体全丢了"，数据其实还在盘上）
+    wv_io.atomic_write_json(os.path.join(out, "_index.json"), idx)
     # 只有真跑过才写缓存（全命中时无需重写，省一次 10MB 落盘）
     if todo:
         _save_decode_cache(out, new_cache)

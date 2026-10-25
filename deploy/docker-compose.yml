@@ -17,6 +17,12 @@ services:
     #   ⚠ 不要写成 "8790:8790"——那会绑到所有网卡（含 IPv6 公网地址）。
     ports:
       - "${WV_BIND_IP:?请先在 deploy/.env 设置 WV_BIND_IP}:8790:8790"
+    # 容器日志封顶：不封顶迟早把宿主盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     volumes:
       # 热数据（vol3 SSD）：整目录挂载
       #   /data 之下即为设计文档规定的结构：

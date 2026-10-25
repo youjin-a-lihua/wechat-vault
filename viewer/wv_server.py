@@ -54,6 +54,40 @@ log = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
+# FTS5 的 trigram 分词器把文本切成三个字符一组的 token，因此**短于 3 个字符
+# 的查询永远命中 0 条**（不报错，只是空结果）。中文最常用的词恰好是两个
+# 字：快递 / 会议 / 老师 / 吃饭 …… 实测 189 万条的库上，「快递」LIKE 有
+# 1016 条、FTS MATCH 返回 0；「羽毛球」3 个字则正常命中。
+# 所以走 FTS 的门槛必须按分词器的最小长度来定，不能凭感觉写 2。
+FTS_MIN_CHARS = 3
+
+# 媒体 URL 白名单：只允许「站内相对路径」与 http(s) 绝对地址。
+# media / media_full 是 DB 里的文本，正常情况下由 wv_media 回填为 /media/xxx，
+# 但库是开放的——用户把别人的 vault.db 拷进来、或旧版解析器写脏了，
+# 就可能混入 javascript:/data: 之类。这些值会被直接拼进 <img src> 与 <a href>，
+# 前者无害（img src 不执行脚本），后者在导出/归档 HTML 里就是可点的 XSS。
+# 白名单只放行两类，其余一律抹成空串（= 退化为占位符，不丢消息）。
+import re as _re
+_MEDIA_OK = _re.compile(r"^(?:https?://|/(?!/))", _re.I)
+
+def _safe_media(v) -> str:
+    """净化 media / media_full：非白名单 scheme 返回空串。"""
+    s = (v or "")
+    if not isinstance(s, str) or not s:
+        return ""
+    s = s.strip()
+    return s if _MEDIA_OK.match(s) else ""
+
+def _sanitize_rows(rows: list) -> list:
+    """出口净化：所有返回给浏览器的消息行都过一遍 scheme 白名单。"""
+    for r in rows:
+        if isinstance(r, dict):
+            if r.get("media"):
+                r["media"] = _safe_media(r["media"])
+            if r.get("media_full"):
+                r["media_full"] = _safe_media(r["media_full"])
+    return rows
+
 # 多账号：直接躺在投放口根目录的文件归入此账号（与 archiver 约定一致）
 DEFAULT_ACCOUNT = "默认账号"
 
@@ -93,6 +127,21 @@ STATE: dict = {
 }
 _lock = threading.Lock()
 
+# 整库级重活的互斥（/api/ingest 与 /api/reload 共用一把）
+#
+# 为什么要锁：/api/ingest 会连着跑「归档 → 媒体链路 → 重载」，动辄几分钟，
+# 全程在写同一份 vault.db；/api/reload 会重建内存索引。两者并发的后果是
+# 后一个覆盖前一个的缓存，或者重载读到一个写了一半的库 —— 前端表现为
+# 「消息数对不上、刚归档的图不显示」，而且很难复现。
+#
+# 两种取锁策略（刻意不同）：
+#   · ingest 非阻塞 —— 同一时刻只该有一个归档在跑。第二个直接 409，
+#     让它排队只会使客户端干等几分钟，不如明确回一句"已经在跑了"。
+#   · reload 带超时阻塞 —— 它自己很快，只有撞上归档才需要等；
+#     给 20 秒耐心，等不到再报错（autosync 下一轮会自己重载，不会永久丢）。
+_HEAVY_LOCK = threading.Lock()
+_HEAVY_LOCK_TIMEOUT = 20
+
 def _setup_logging() -> None:
     """统一日志配置：级别取 WV_LOG_LEVEL（默认 INFO），已配置则不覆盖。
 
@@ -101,14 +150,32 @@ def _setup_logging() -> None:
     但 info/debug 需要显式配置级别，故在此统一初始化。
     """
     import logging as _lg
+    from logging.handlers import RotatingFileHandler
     if _lg.getLogger().handlers:
         return
     lvl = (os.environ.get("WV_LOG_LEVEL") or "INFO").upper()
-    _lg.basicConfig(
-        level=getattr(_lg, lvl, _lg.INFO),
-        format="%(asctime)s %(levelname).1s %(name)s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    fmt = _lg.Formatter("%(asctime)s %(levelname).1s %(name)s | %(message)s",
+                        datefmt="%H:%M:%S")
+    root = _lg.getLogger()
+    root.setLevel(getattr(_lg, lvl, _lg.INFO))
+    sh = _lg.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    # 可选文件日志：容器日志靠 docker 的 max-size 兜底，但 autosync 那一侧
+    # （s6 长跑服务）stdout 会被 s6 收走，查问题时常常只剩半截。
+    # 设 WV_LOG_FILE 就同时落一份带轮转的，满了自动切，不会把数据盘撑爆。
+    lf = os.environ.get("WV_LOG_FILE", "").strip()
+    if lf:
+        try:
+            mb = float(os.environ.get("WV_LOG_MAX_MB", "20"))
+            keep = int(os.environ.get("WV_LOG_KEEP", "3"))
+            fh = RotatingFileHandler(lf, maxBytes=int(mb * 1024 * 1024),
+                                     backupCount=max(1, keep), encoding="utf-8")
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except OSError as e:
+            # 日志目录不可写不该让服务起不来
+            print("无法开启文件日志（%s）：%s" % (lf, e), file=sys.stderr)
 
 _setup_logging()
 
@@ -157,8 +224,44 @@ AUTH = {
                     (os.environ.get("WV_ALLOW_CIDRS", "") or "").split(",") if c.strip()],
     "throttle": A.LoginThrottle(),
     "setup_skipped": bool(_file_auth.get("setup_skipped")),
+    # 代际号：+1 就让所有已发出的票作废（怀疑泄漏 / 改密码时用）
+    "epoch": int(_file_auth.get("epoch") or 1),
+    # 已吊销的会话号（退出登录时登记，只针对那一张票）
+    "revoked": set(_file_auth.get("revoked") or []),
 }
 AUTH["enabled"] = bool(AUTH["hash"])
+
+def _persist_revoked() -> None:
+    """把吊销名单写回 auth.json（与密码哈希同文件，随数据卷持久）。"""
+    data = _load_file_auth()
+    data["revoked"] = A.prune_revoked(AUTH["revoked"])
+    data["epoch"] = AUTH["epoch"]
+    try:
+        _persist_auth(data)
+    except OSError as e:
+        log.warning("写入吊销名单失败（本次退出仅在本次进程内有效）：%s", e)
+
+def _cookie_secure(req: Request) -> bool:
+    """Cookie 是否加 secure。
+
+    局域网普遍是 http，硬加 secure 会让 Cookie 根本存不下来（等于永远登不上）。
+    所以只在**确实走 https** 时才加：显式配了 WV_COOKIE_SECURE=1，
+    或请求本身是 https（含挂在反向代理后面时看 X-Forwarded-Proto）。
+    """
+    if os.environ.get("WV_COOKIE_SECURE", "") in ("1", "true", "True", "yes"):
+        return True
+    if req.url.scheme == "https":
+        return True
+    return (req.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+            == "https")
+
+def _set_session_cookie(resp, req: Request, token: str) -> None:
+    """下发会话 Cookie（登录/初始化/滑动续期共用，避免各处参数写歪）。"""
+    resp.set_cookie(
+        A.COOKIE_NAME, token, max_age=A.token_ttl(),
+        httponly=True, samesite="lax", path="/",
+        secure=_cookie_secure(req),
+    )
 
 # 不需要登录即可访问的路径
 PUBLIC_PATHS = {
@@ -170,9 +273,58 @@ PUBLIC_PATHS = {
     "/manifest.webmanifest", "/sw.js",
 }
 
-def _client_ip(req: Request) -> str:
-    """客户端 IP（本服务直接暴露在局域网，无反向代理，取连接对端即可）。"""
+def _peer_ip(req: Request) -> str:
+    """TCP 对端地址（**不可伪造**）。
+
+    凡是"只信本机"的判断（比如 /api/reload 的回环放行）都必须用它，
+    不能用 _client_ip —— 后者在开启反向代理时会去读 X-Forwarded-For，
+    而那个头是客户端可以自己塞的。
+    """
     return (req.client.host if req.client else "") or ""
+
+def _client_ip(req: Request) -> str:
+    """客户端 IP（本服务直接暴露在局域网，无反向代理，取连接对端即可）。
+
+    挂在反向代理后面时，对端永远是代理自己，网段白名单和登录限流就全废了。
+    那时设 WV_TRUST_PROXY=1，改从 X-Forwarded-For / X-Real-IP 取。
+
+    ⚠️ 只有**确实**有一层可信反向代理时才开：HTTP 头是客户端能自己写的，
+    直接暴露时开着它，任何人都能伪造 IP 绕过网段白名单和登录限流。
+    """
+    if os.environ.get("WV_TRUST_PROXY", "") not in ("1", "true", "True", "yes"):
+        return _peer_ip(req)
+    xff = req.headers.get("x-forwarded-for", "")
+    if xff:
+        # XFF 形如 "client, proxy1, proxy2"：取最左边那个（原始客户端）
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    real = req.headers.get("x-real-ip", "").strip()
+    if real:
+        return real
+    return _peer_ip(req)
+
+def _health_probe():
+    """健康探测：真的去开一下库，别只会回 {"ok": true}。
+
+    以前这里无条件 200，于是"容器在跑但库读不了"（卷没挂上、权限错、
+    vault.db 被写坏）在 docker ps 里一律显示 healthy —— 监控等于没有。
+    现在：库还没配置 → 200（启动早期，正常）；库配置了但打不开/查不动 → 503。
+    """
+    path = STATE.get("index_path")
+    if not path or not os.path.exists(path):
+        return JSONResponse({"ok": True, "db": "not-loaded"})
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=2)
+        try:
+            conn.execute("SELECT 1 FROM conv LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log.warning("健康检查打不开归档库：%s", e)
+        return JSONResponse({"ok": False, "db": "unreadable",
+                             "detail": str(e)[:200]}, status_code=503)
+    return JSONResponse({"ok": True, "db": "ok"})
 
 @app.middleware("http")
 async def _auth_guard(req: Request, call_next):
@@ -183,14 +335,16 @@ async def _auth_guard(req: Request, call_next):
     #       既不在局域网白名单里，也不会带 Cookie。若不前置，容器会永远 unhealthy。
     # 该端点不返回任何聊天数据，暴露风险为零。
     if path == "/healthz":
-        return JSONResponse({"ok": True})
+        return _health_probe()
 
     # autosync 从容器内 127.0.0.1 调 /api/reload。它没有登录态、不带 session
     # cookie，一旦设置了访问密码就会拿到 401 —— 结果是媒体关联明明跑完了，
     # 查看器还在用旧缓存，新消息的图片/表情永远不显示。
     # 回环地址与容器同生共死，放行它不扩大攻击面；真正的入口仍由后面的
     # 网段白名单和密码守着。
-    if path == "/api/reload" and _client_ip(req) in ("127.0.0.1", "::1"):
+    # 这里必须用**对端地址**：开了 WV_TRUST_PROXY 后 _client_ip 会读
+    # X-Forwarded-For，而那个头谁都能写 —— 用它会变成"任何人都能触发重载"。
+    if path == "/api/reload" and _peer_ip(req) in ("127.0.0.1", "::1"):
         return await call_next(req)
 
     # 尚未初始化：没设密码、也没跳过设置
@@ -224,8 +378,15 @@ async def _auth_guard(req: Request, call_next):
 
     # 校验会话
     token = req.cookies.get(A.COOKIE_NAME, "")
-    if A.check_token(AUTH["secret"], token):
-        return await call_next(req)
+    if A.check_token(AUTH["secret"], token, AUTH["epoch"], AUTH["revoked"]):
+        resp = await call_next(req)
+        # 滑动续期：票还剩不到一天就换一张新的。
+        # 主动使用者永远在线，人走了票自然过期——比"固定 30 天"更合理，
+        # 也让一份泄漏出去的票最多活 7 天而不是 30 天。
+        if A.token_left(AUTH["secret"], token) < A.RENEW_LEFT:
+            _set_session_cookie(resp, req, A.make_token(AUTH["secret"],
+                                                        epoch=AUTH["epoch"]))
+        return resp
 
     # 未登录
     if path.startswith("/api/"):
@@ -275,20 +436,39 @@ async def api_login(req: Request):
             {"detail": "密码错误", "left": left_tries}, status_code=401)
 
     AUTH["throttle"].reset(ip)
-    token = A.make_token(AUTH["secret"])
+    token = A.make_token(AUTH["secret"], epoch=AUTH["epoch"])
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        A.COOKIE_NAME, token, max_age=A.TOKEN_TTL,
-        httponly=True, samesite="lax", path="/",
-        # 内网多用 http，故不设 secure；如需 https 可置 True
-        secure=False,
-    )
+    _set_session_cookie(resp, req, token)
     return resp
 
 @app.post("/api/logout")
-def api_logout():
-    """退出登录：清掉会话 Cookie。"""
-    resp = JSONResponse({"ok": True})
+async def api_logout(req: Request):
+    """退出登录：吊销当前这张票，并清掉 Cookie。
+
+    原来只是 delete_cookie——那只是让**这个浏览器**忘掉 Cookie，
+    票本身还是有效的：谁把它抄走（或浏览器没删干净），照样能进。
+    现在把票的 sid 记进吊销名单，服务端这边也认它作废。
+    传 {"all": true} 则把代际号 +1，所有设备的票一起失效
+    （怀疑票泄漏、又不想改密码时用）。
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    kick_all = isinstance(body, dict) and bool(body.get("all"))
+
+    token = req.cookies.get(A.COOKIE_NAME, "")
+    p = A.parse_token(AUTH["secret"], token)
+    if kick_all:
+        AUTH["epoch"] = int(AUTH["epoch"]) + 1
+    elif p:
+        AUTH["revoked"].add(p[2])
+    elif token:
+        # 票不是本实例签的（换过 secret、或别的实例签发的）：没有 sid 可吊销，
+        # 至少把 Cookie 清掉，不留个"我退出了"的假象
+        log.debug("退出登录时票无法解析，仅清理 Cookie")
+    _persist_revoked()
+    resp = JSONResponse({"ok": True, "kick_all": kick_all})
     resp.delete_cookie(A.COOKIE_NAME, path="/")
     return resp
 
@@ -334,10 +514,12 @@ async def api_setup(req: Request):
     AUTH["hash"] = new_hash
     AUTH["secret"] = new_secret
     AUTH["enabled"] = True
-    token = A.make_token(AUTH["secret"])
+    # secret 换了，老票的签名必然对不上；代际号归位，吊销名单也就没用了
+    AUTH["epoch"] = 1
+    AUTH["revoked"] = set()
+    token = A.make_token(AUTH["secret"], epoch=AUTH["epoch"])
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(A.COOKIE_NAME, token, max_age=A.TOKEN_TTL,
-                    httponly=True, samesite="lax", path="/", secure=False)
+    _set_session_cookie(resp, req, token)
     return resp
 
 @app.post("/api/setup/skip")
@@ -636,10 +818,28 @@ def _ensure_schema(db: Path) -> None:
             ("msg", "media_full", "TEXT"),
             # 显示名会重名（实测 199 组），头像必须靠 username 才能精确对上
             ("msg", "sender_username", "TEXT DEFAULT ''"),
+            # 会话的稳定身份：同步链路用它做 conv_id 的键
+            ("conv", "username", "TEXT DEFAULT ''"),
         ):
             if table in tables and col not in cols(c, table):
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
                 changed = True
+
+        # 排序索引：--data（临时扫描）模式建的库以前只有 idx_msg_conv_ts，
+        # 缺 (conv_id, ts, seq, msg_id) 的完整排序索引 —— 于是 /api/messages
+        # 只能取出整个会话再排序取前 200（18 万条的群聊就是全取一次）。
+        # store 模式由 wv_sync.ensure_schema 建，这里补 scan 模式的那一半。
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON msg(conv_id, ts)",
+            "CREATE INDEX IF NOT EXISTS idx_msg_conv_ts_full"
+            " ON msg(conv_id, ts, seq, msg_id)",
+            "CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg(ts)",
+            "CREATE INDEX IF NOT EXISTS idx_conv_account ON conv(account)",
+        ):
+            try:
+                c.execute(ddl)
+            except sqlite3.Error as e:
+                log.debug("补索引跳过（%s）：%s", ddl.split("IF NOT EXISTS")[1].strip(), e)
 
         fts = cols(c, "msg_fts")
         if fts and "account" not in fts:
@@ -722,13 +922,21 @@ def api_reload():
     """重新加载数据（归档器更新库后可调用，无需重启服务）。"""
     if not STATE["data_dir"]:
         raise HTTPException(400, "未配置数据目录")
-    d = Path(STATE["data_dir"])
-    if STATE.get("mode") == "store":
-        res = load_store(d)
-    else:
-        res = load_data(d)
-    _invalidate_derived_caches()
-    return {"ok": True, **res}
+    # 归档进行中时不重载：那会儿 vault.db 正在被写，读到的是写了一半的库。
+    # 给它 20 秒耐心（重载本身很快，撞上归档才需要等）；等不到就报错，
+    # autosync 下一轮还会再来一次，不会永久丢。
+    if not _HEAVY_LOCK.acquire(timeout=_HEAVY_LOCK_TIMEOUT):
+        raise HTTPException(409, "归档任务正在运行，请稍后重试")
+    try:
+        d = Path(STATE["data_dir"])
+        if STATE.get("mode") == "store":
+            res = load_store(d)
+        else:
+            res = load_data(d)
+        _invalidate_derived_caches()
+        return {"ok": True, **res}
+    finally:
+        _HEAVY_LOCK.release()
 
 # 投放口路径（供 /api/ingest 使用）：默认为归档库同级的 inbox，
 # 可用环境变量 WV_INBOX 覆盖。存档轨投放口为 inbox/raw。
@@ -747,6 +955,18 @@ def _raw_dirs() -> tuple[Path, Path]:
 
 @app.post("/api/ingest")
 def api_ingest():
+    """立即归档收件箱里的新文件（真正的实现在 _do_ingest，本函数只管并发）。
+
+    归档全程独占：详见文件上方 _HEAVY_LOCK 的注释。
+    """
+    if not _HEAVY_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "已有归档/重载任务在运行，请稍后再试")
+    try:
+        return _do_ingest()
+    finally:
+        _HEAVY_LOCK.release()
+
+def _do_ingest():
     """立即把收件箱里的新文件归档入库（不等定时任务）。
 
     这是 Windows 端「一键投递」调用的接口 —— 投递完文件后触发，
@@ -949,6 +1169,7 @@ def api_messages(
         rows.reverse()  # 保证返回时始终按时间正序，便于前端拼接
     for r in rows:
         r["is_self"] = bool(r["is_self"])
+    _sanitize_rows(rows)
     return {"conv_id": conv_id, "total": total, "offset": offset,
             "limit": limit, "has_more": offset + len(rows) < total, "items": rows}
 
@@ -965,8 +1186,9 @@ def api_search(
 ):
     """「查找聊天记录」数据源：关键词 + 类型 + 日期区间 组合筛选。
 
-    中文走 trigram FTS；关键词短于 2 字或 FTS 不可用时回落 LIKE。
-    关键词为空时退化成纯条件浏览 —— 这正是「按日期查找聊天记录」的用法。
+    中文走 trigram FTS；**关键词短于 3 个字符时必须回落 LIKE**，原因见
+    `FTS_MIN_CHARS`；FTS 不可用时同样回落。关键词为空时退化成纯条件浏览
+    —— 这正是「按日期查找聊天记录」的用法。
     """
     q = (q or "").strip()
     type_list = [t.strip() for t in (types or "").split(",") if t.strip()]
@@ -995,17 +1217,29 @@ def api_search(
     hits: list[dict] = []
     total = 0
     with _db() as conn:
-        fts_ok = False
-        if q and len(q) >= 2:
+        # 「FTS 能用」和「FTS 有命中」必须分开看。
+        # 原写法 fts_ok = total > 0：关键词搜不到时 total=0 → 判成 FTS 不可用
+        # → 掉进 LIKE 分支，对 189 万行做一次全表 content LIKE '%x%'（几秒起步）。
+        # 实际上 FTS 明明跑通了，答案就是「没有」。只有 FTS 真的不可用
+        # （表不存在 / MATCH 语法错）或压根没关键词时，才需要 LIKE 兜底。
+        #
+        # 另一个坑（实测踩到）：trigram 分词器把文本切成**三个字符**一组的
+        # token，所以短于 3 个字符的查询**永远命中 0 条**——它不报错，只返回空。
+        # 中文最常用的词恰好是两个字（快递、会议、老师、吃饭），于是
+        # `len(q) >= 2` 这个判断让这些查询"成功地"查出 0 条，并且因为
+        # fts_usable=True 永远不回落 LIKE，搜索等于完全失效。
+        # 所以长度门槛必须是 FTS_MIN_CHARS（3），不是 2。
+        fts_usable = False
+        if q and len(q) >= FTS_MIN_CHARS:
             where, fparams = _conds("m.")
             try:
                 total = conn.execute(
                     "SELECT COUNT(*) FROM msg_fts f JOIN msg m ON m.msg_id=f.msg_id "
                     "WHERE msg_fts MATCH ?" + where, [f'"{q}"'] + fparams).fetchone()[0]
-                fts_ok = total > 0
+                fts_usable = True
             except sqlite3.OperationalError:
-                total, fts_ok = 0, False
-        if fts_ok:
+                total, fts_usable = 0, False
+        if fts_usable:
             where, fparams = _conds("m.")
             hits = [dict(r) for r in conn.execute(
                 "SELECT m.* FROM msg_fts f JOIN msg m ON m.msg_id=f.msg_id "
@@ -1026,6 +1260,7 @@ def api_search(
     for h in hits:
         h["is_self"] = bool(h["is_self"])
         h.setdefault("account", "")
+    _sanitize_rows(hits)
     return {"query": q, "count": len(hits), "total": total, "offset": offset,
             "limit": limit, "has_more": offset + len(hits) < total, "items": hits}
 
@@ -1039,7 +1274,14 @@ def api_calendar(
 
     返回逐日条数与分类计数，供前端渲染**月历**（与原生微信一致的日期速查）。
     默认上限 4000 天（≈11 年），足够覆盖全量历史；全库跨度 757 天。
+
+    结果按 (conv_id, account, limit) 缓存：日期面板会被反复开关，而聚合结果
+    在同一批数据下是稳定的，没必要每次重扫一遍整个会话。归档/重载时失效。
     """
+    key = (conv_id, account, limit)
+    cached = _CAL_CACHE.get(key)
+    if cached is not None:
+        return cached
     conds, params = ["ts IS NOT NULL"], []
     if conv_id:
         conds.append("conv_id=?")
@@ -1057,7 +1299,9 @@ def api_calendar(
         rng = conn.execute(
             f"SELECT MIN(ts) a, MAX(ts) b FROM msg{where}", params).fetchone()
     fmt = lambda t: dt.datetime.fromtimestamp(t, TZ8).strftime("%Y-%m-%d") if t else ""
-    return {"days": days, "first": fmt(rng["a"]), "last": fmt(rng["b"])}
+    result = {"days": days, "first": fmt(rng["a"]), "last": fmt(rng["b"])}
+    _CAL_CACHE[key] = result
+    return result
 
 @app.get("/api/locate")
 def api_locate(
@@ -1099,10 +1343,14 @@ def api_locate(
             "index": index, "seq": row["seq"], "ts": row["ts"], "msg_id": row["msg_id"]}
 
 _STATS_CACHE: dict[tuple, dict] = {}
+# 日历聚合缓存：/api/calendar 要按天扫一整个会话（18 万条的群聊就是 18 万行）。
+# 日期面板会被反复开关，结果在同一批数据下是稳定的，没必要每次重扫。
+_CAL_CACHE: dict[tuple, dict] = {}
 
 def _invalidate_derived_caches() -> None:
-    """归档 / 重载后清空派生缓存（统计结果只在数据变化时失效）。"""
+    """归档 / 重载后清空派生缓存（统计/日历结果只在数据变化时失效）。"""
     _STATS_CACHE.clear()
+    _CAL_CACHE.clear()
 
 @app.get("/api/stats")
 def api_stats(
@@ -1210,6 +1458,9 @@ def _iter_convs(conv_id: str = "", account: str = ""):
                 "SELECT msg_id, seq, ts, time_str, sender, is_self, type, "
                 "content, media FROM msg WHERE conv_id=? "
                 "ORDER BY COALESCE(ts,0), seq", (h["conv_id"],))]
+            # 导出会生成可离线打开的 HTML 文件，里面的 <a href> 是可点的，
+            # 必须和 Web API 出口一样过 scheme 白名单
+            _sanitize_rows(h["messages"])
             h["account"] = h.get("account") or DEFAULT_ACCOUNT
             yield h
     finally:

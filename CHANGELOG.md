@@ -3,6 +3,115 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.2] - 2026-10-25
+
+### 变更（破坏性：会话键改了）
+- **`conv_id` 改为以 username 为键**：原键是 `账号::显示名`，而显示名会变——
+  对方改备注、群改名、备注被清空，下一次同步就算出一个「新」会话。
+  **而且 `msg_id = sha1(conv_id|local_id|ctime)` 是从它派生的**，键一变，
+  整段历史的所有消息 id 全部失效，被当成新消息原样重插一遍：
+  列表里多一行、库里多几万条重复，而且越用越深。
+  新键是 `账号::username`（`wxid_*` / `*@chatroom`，微信内部不可变标识），
+  显示名降级为 `conv.title` 这个普通字段，怎么改都不影响键。
+  - 新增 `migrate_conv_keys()`：老库自动迁移 `conv.conv_id`、`msg.conv_id`，
+    并按新键重算 `db-` 前缀的 `msg_id`。`json-` 前缀的 id 是按文件序号算的、
+    反推不出原始字段，只迁 `conv_id` 不动 id（它们的定位信息本来就跟着走）。
+  - 新增 `conv.username` 列与 `idx_conv_username`；老库由 `migrate_schema` /
+    `ensure_schema` 补列（**先补列再建索引**，否则 `CREATE INDEX` 直接报
+    `no such column`）。
+  - 显示名撞车（实测 4933 个联系人里 199 组同名）时用该会话出现过的
+    `sender_username` 认人；仍判不出的**宁可不迁**，记进 `stuck`，
+    主循环沿用老键——猜错就是把陌生人的聊天合并到一起，比不迁严重得多。
+  - 迁移后整体重建一次 `msg_fts`（逐行改 UNINDEXED 列等于每行全表扫）。
+  - JSON 导入链路同步改 `_resolve_cid()`，与新键合并而不是另起一行。
+  - 区分两种「没迁走」，别混成一个失败数：
+    `legacy` = 显示名在当前微信号里根本不存在（实测 10 个，全是 JSON 导入
+    遗留，消息 id 都是 `json-` 前缀、本轮同步不碰，保持老键无风险）；
+    `stuck` = 同名多人且判不出（实测 2 个：「梁辉」里混了 3 个 wxid、
+    「电信客服专员」里混了 3 个 openim 号，都是早先按显示名合并出的脏数据）。
+  - **升级提示**：首次启动会自动迁移。生产库实测（1,365 MB / 189 万条）：
+    conv 479 → 479、msg 1,894,727 → 1,894,727（零重复）、消息内容指纹
+    完全一致、改写 464 个会话（1,719,560 条消息）、耗时 86 s（单事务）。
+    回滚只能靠备份的 `vault.db`，因为 `msg_id` 已被改写。
+    **必须先部署新代码再迁移**：旧代码按显示名算键，认不出新键会把历史
+    按新 msg_id 再插一遍——这正是本次要根治的问题。
+
+### 安全
+- **会话 token 从 30 天不可撤销改为 7 天 + 可撤销**：
+  `exp.epoch.sid.sig` 四段签名。
+  - 有效期 7 天（`WV_TOKEN_TTL_DAYS` 可调，下限 1 小时），剩余不足 24h 时
+    自动续签（滑动续期，长期在用不会突然掉线）。
+  - 单 session 登出：`sid` 进吊销名单（`MAX_REVOKED=200` 上限，LRU 淘汰）。
+  - 全局踢人：`POST /api/logout {"all":true}` 递增 `epoch`，所有旧 token 立刻失效。
+  - HTTPS 反代下自动加 `Secure`（`WV_COOKIE_SECURE=1` 强制）。
+  - 老 token（三段式）一律视为无效，升级后需要重新登录一次。
+- **媒体链接协议白名单**：`msg.media` / `media_full` 原来直接插进 `src`/`href`，
+  库里若存在 `javascript:` / `data:text/html` 这类值，在归档导出模式下
+  点一下就是可执行的 XSS。前后端各加一道：后端 `_safe_media()` 只放行
+  `http(s)://` 与本站绝对路径（`/(?!/)`，排除 `//evil.com`），
+  前端 `safeUrl()` 同规则；`/api/messages`、`/api/search`、导出三条路径全覆盖。
+- **代理头不再默认信任**：`_client_ip()` 只在 `WV_TRUST_PROXY=1` 时才读
+  `X-Forwarded-For` / `X-Real-IP`。默认直连部署下这两个头是客户端随便写的，
+  信了就等于把 `WV_ALLOW_CIDRS` 白名单和「仅本机可 reload」一起送人。
+  `/api/reload` 的本机判定改用不可伪造的 `_peer_ip()`（TCP 对端地址）。
+- `WV_ALLOW_CIDRS` 支持 IPv6（`2001:db8::/32`、`::1/128`），
+  基于 `ipaddress` 解析，v4/v6 分开比对，解析不了一律拒绝（deny by default）。
+
+### 新增
+- **查看器日志落盘**：`WV_LOG_FILE` 开启 `RotatingFileHandler`
+  （`WV_LOG_MAX_MB` 单文件上限、`WV_LOG_KEEP` 保留份数）。
+  autosync 侧同样支持，容器日志另加 compose 级 `json-file` 轮转
+  （`max-size: 20m` / `max-file: 3`）——否则长期运行会把磁盘写满。
+- **`/healthz` 真检查库**：原来只回一个固定 200，容器 healthy 与数据库
+  是否可读毫无关系。现在以 `mode=ro` 打开 vault.db 并 `SELECT 1 FROM conv`，
+  失败返回 503，DB 损坏/被锁时 Docker 能真的把容器标成 unhealthy。
+- **`wv_io.py`**：`atomic_write_text()` / `atomic_write_json()`
+  （同目录 `mkstemp` → `fsync` → `os.replace`）。`media/_index.json` 与
+  `raw-snapshots/archive-index.json` 改用它——原来直接覆盖写，
+  进程在写一半时被杀就是一个截断的 JSON，下次启动整份索引读不出来。
+
+### 修复
+- **两字中文搜索静默失效（生产实测证实）**：`/api/search` 用 `len(q) >= 2`
+  决定是否走 trigram FTS，但 **trigram 分词器把文本切成三个字符一组的
+  token，短于 3 个字符的查询永远命中 0 条**——它不报错，只返回空。
+  于是中文最常用的两个字（快递 / 会议 / 老师 / 吃饭）「成功地」查出 0 条，
+  又因为 `fts_usable=True` 永不回落 LIKE，搜索等于完全失效。
+  实测 189 万条的库上：`MATCH '快递'` = 0 条，`LIKE '%快递%'` = 1016 条；
+  `'羽毛球'`（3 字）则正常命中 2933 条。
+  修法：新增 `FTS_MIN_CHARS = 3` 常量，门槛按分词器实际最小长度定；
+  短于 3 字回落 LIKE。修复后线上验证「快递」返回 **1017 条**。
+  回归测试用内存 FTS5 表直接断言分词器行为，避免再次凭感觉写下限。
+- **同步链路缺 `msg_fts` 导致搜索永远全表扫**：从微信库同步建的库
+  （没走过 JSON 导入）根本没有全文索引表，`/api/search` 每次都回落
+  `LIKE '%词%'` 扫 189 万行。现在 `ensure_schema` 直接建出来，
+  并由 `ensure_fts()` 补齐缺口（临时表 + PRIMARY KEY，避免
+  `NOT IN (SELECT ...)` 在 UNINDEXED 列上退化成 O(n²)）。
+  生产库实测索引从 937,823 行补到 **1,170,659** 行，此前 **232,836 条**
+  消息根本搜不到。
+- **搜索零命中时回落全表扫**：原判断是 `fts_ok = 命中数 > 0`，
+  于是「这个词确实搜不到」被当成「索引不可用」，转去 LIKE 扫全库。
+  改为按「FTS 是否可用」判断，与命中数无关。
+- **`/api/ingest` 与 `/api/reload` 并发无锁**：两个请求同时跑会往同一个
+  `vault.db` 写、互相覆盖缓存。加 `_HEAVY_LOCK`：ingest 拿不到锁直接 409
+  （让调用方稍后重试），reload 最多等 20s。
+- **前端 DOM 无限增长**：长会话翻到底会积累上万个节点，滚动卡顿到不可用。
+  上限 3000 条，超出回收最旧的节点；往回翻到底部时重新拉最新窗口
+  （而不是继续往 DOM 里堆）。提示语与「回到今天」同步适配。
+- **`_CAL_CACHE` 未失效**：切换会话/入库后日历计数还是旧的。改为按
+  `(conv_id, 年月)` 缓存并在 `_invalidate_derived_caches()` 里整体清空。
+- **`/api/messages` 排序键**：改用 `idx_msg_conv_ts_full(conv_id, ts, seq, msg_id)`
+  覆盖，避免大会话（实测最大 18 万条）走 TEMP B-TREE 全排序。
+
+### 工程
+- 新增单测 30 项：`tests/unit/test_wv_auth.py`（token 有效期/续期/吊销/epoch、
+  CIDR v4+v6+拒绝、媒体协议白名单）与 `tests/unit/test_wv_sync.py`
+  （会话键迁移全矩阵：改名、幂等、`json-` 保留、歧义跳过、歧义由
+  `sender_username` 判定、合并、跨账号隔离、`stuck` 回传，
+  外加「老库缺 username 列时 `ensure_schema` 不得崩」的回归测试）。
+- 日志里的 `print` 全部改走 `logging`，preflight 的静默异常检查清零。
+
+---
+
 ## [0.3.1] - 2026-10-25
 
 ### 修复

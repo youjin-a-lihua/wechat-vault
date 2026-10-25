@@ -27,14 +27,23 @@ const state = {
   // 分页 / 无缝加载
   hasMore: false,
   loadingMore: false,
+  // DOM 窗口：列表里最多保留多少条消息节点。
+  // 没有上限时，10 万条的大群一路往上翻会把 10 万个节点全塞进 DOM，
+  // 浏览器越翻越卡（滚动掉帧、内存几百 MB）。3000 条 ≈ 15 页，
+  // 足够几屏连续阅读，超出后按"离视口最远的一端"回收。
+  // 超过这个数就停止自动加载，改由用户点「继续加载更早」显式推进，
+  // 避免"只是想滑到底"就被静默灌进几千个节点。
+  tailTrimmed: false,    // 最新的那批已被回收（滚回底部时需要重新拉一次）
   // 按日期查找
   calView: 'cal',       // cal | list
   calDays: {},          // 'YYYY-MM-DD' → {n,img,vid,fil,lnk,voi}
   calFirst: '',
   calLast: '',
   calYM: '',
-  curConv: null,        // 当前会话的元信息快照（侧栏筛选后 state.convs 里可能找不到它）
 };
+
+/* DOM 里最多留多少条消息节点（见 state 里的注释） */
+const MAX_DOM_MSGS = 3000;
 
 /* ------------------------------ 工具 ------------------------------ */
 
@@ -43,6 +52,20 @@ const esc = s => String(s ?? '')
   .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 
 const escRe = s => String(s).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+
+/* 媒体 URL 白名单：只放行站内相对路径（/media/...）与 http(s)。
+   media 来自 DB 文本，服务端出口已净化一遍；这里是第二道。
+   挡的是 javascript:/data:/vbscript: —— 它们被拼进 <a href> 后
+   在导出的 HTML 里是真能点的执行入口。不认识的 scheme 一律当作"无媒体"，
+   退化成占位符，消息本身不丢。 */
+const safeUrl = u => {
+  const s = String(u ?? '').trim();
+  if (!s) return '';
+  if (s.startsWith('//')) return '';                 // 协议相对 → 可能跳外站
+  if (s.startsWith('/')) return s;                   // 站内绝对路径
+  if (/^https?:\/\//i.test(s)) return s;
+  return '';
+};
 
 function fmtTime(ts, brief = true) {
   if (!ts) return '';
@@ -213,6 +236,8 @@ async function loadConvs() {
   if (state.account) p.set('account', state.account);
   const d = await api('/api/conversations?' + p);
   state.convs = d.items;
+  // 会话列表刷新意味着库里可能有新消息，日历聚合就此失效
+  invalidateCalCache();
   renderConvs();
 }
 
@@ -281,9 +306,17 @@ async function openConv(id) {
   syncFinderUI();   // 打开会话后「当前会话」范围才可用
 
   // 首屏：加载最后 N 条
+  await loadNewestWindow();
+  updateFindBar();
+}
+
+/* 清空列表并重新拉「最新的一屏」（打开会话 / 从历史深处回到最新 都走这里） */
+async function loadNewestWindow() {
+  const id = state.current;
   state.msgLoaded = 0;
   state.hasMore = false;
   state.loadingMore = false;
+  state.tailTrimmed = false;
   $('#msgList').innerHTML = '';
   const last = await api(`/api/messages?conv_id=${encodeURIComponent(id)}&offset=0&limit=${state.pageSize}&order=desc`);
   state.msgTotal = last.total;
@@ -301,7 +334,30 @@ async function openConv(id) {
     guard++;
   }
   scrollToBottom(false);
-  updateFindBar();
+}
+
+function domMsgCount() {
+  return $('#msgList') ? $('#msgList').children.length : 0;
+}
+
+/* 节点回收：超过 MAX_DOM_MSGS 时，从"离视口最远的那一端"去掉多余的。
+
+   列表只在向上翻（加载更早）时增长，新节点插在顶部，所以被挤远的永远是
+   **最新**的那批——它们此刻在屏幕下方很远的地方。回收后记 tailTrimmed，
+   用户滚回底部时再拉一次最新窗口（见 onScroll / jumpToday）。
+   offset 不用改：它数的是"从最新端跳过多少条"，跟 DOM 里还剩几条无关。 */
+function trimDomIfNeeded() {
+  const list = $('#msgList');
+  if (!list) return 0;
+  const over = list.children.length - MAX_DOM_MSGS;
+  if (over <= 0) return 0;
+  let n = 0;
+  while (n < over && list.lastElementChild) {
+    list.removeChild(list.lastElementChild);
+    n++;
+  }
+  if (n) state.tailTrimmed = true;
+  return n;
 }
 
 /* ------------------------------ 渲染消息 ------------------------------ */
@@ -378,29 +434,32 @@ function buildMsg(m) {
 
   let inner = '';
   const t = m.type;
+  // 先过白名单：下面所有 src/href 都用净化后的值，绝不直接用 m.media
+  const mu = safeUrl(m.media);
+  const mf = safeUrl(m.media_full);
 
   if (t === 'image') {
-    if (m.media) {
+    if (mu) {
       // media = 缩略图（列表快），media_full = WxAM 解出的原图（点开才加载）
-      inner = `<div class="bubble media"><img src="${esc(m.media)}" loading="lazy" alt="图片" data-zoom="1"`
-        + (m.media_full ? ` data-full="${esc(m.media_full)}"` : "") + `></div>`;
+      inner = `<div class="bubble media"><img src="${esc(mu)}" loading="lazy" alt="图片" data-zoom="1"`
+        + (mf ? ` data-full="${esc(mf)}"` : "") + `></div>`;
     } else {
       inner = `<div class="bubble"><div class="media-ph">🖼 ${esc(m.content || '[图片]')}</div></div>`;
     }
   } else if (t === 'voice') {
     // 语音：已解码为 WAV → 直接内联播放器；未解出则保留占位
-    inner = m.media
-      ? `<div class="bubble voice"><audio controls preload="none" src="${esc(m.media)}"></audio>`
+    inner = mu
+      ? `<div class="bubble voice"><audio controls preload="none" src="${esc(mu)}"></audio>`
         + `<span class="voice-len">${esc((m.content || '').replace(/[\[\]]/g, ''))}</span></div>`
       : `<div class="bubble"><div class="media-ph">🎤 ${esc(m.content || '[语音]')}</div></div>`;
   } else if (t === 'video') {
     // 视频：有 mp4 就播；只有封面（_thumb.jpg）时显示封面并提示
-    if (m.media && /\.mp4$/i.test(m.media)) {
-      inner = `<div class="bubble media"><video src="${esc(m.media)}" controls preload="metadata"`
+    if (mu && /\.mp4$/i.test(mu)) {
+      inner = `<div class="bubble media"><video src="${esc(mu)}" controls preload="metadata"`
         + ` style="max-width:300px;border-radius:5px"></video></div>`;
-    } else if (m.media) {
+    } else if (mu) {
       inner = `<div class="bubble media video-cover" title="本机未留存原视频，仅封面">`
-        + `<img src="${esc(m.media)}" loading="lazy" alt="视频封面" data-zoom="1">`
+        + `<img src="${esc(mu)}" loading="lazy" alt="视频封面" data-zoom="1">`
         + `<span class="vc-badge">▶</span></div>`;
     } else {
       inner = `<div class="bubble"><div class="media-ph">🎬 ${esc(m.content || '[视频]')}</div></div>`;
@@ -408,16 +467,16 @@ function buildMsg(m) {
   } else if (t === 'file') {
     // 文件：本机留存的原始文件 → 直接给下载链接（保留真实文件名）
     const fm = /\[文件\]\s*(.+)$/.exec(m.content || '');
-    inner = m.media
-      ? `<div class="bubble file-b"><a class="file-link" href="${esc(m.media)}"`
+    inner = mu
+      ? `<div class="bubble file-b"><a class="file-link" href="${esc(mu)}"`
         + ` download="${esc(fm ? fm[1] : '')}"><span class="fl-ic">📄</span>`
         + `<span class="fl-nm">${esc(fm ? fm[1] : (m.content || '文件'))}</span>`
         + `<span class="fl-dl">下载</span></a></div>`
       : `<div class="bubble"><div class="media-ph">📎 ${esc(m.content || '[文件]')}</div></div>`;
   } else if (t === 'emoji') {
     // 表情包：已下载到本地 → 直接显示动图；否则显示占位
-    inner = m.media
-      ? `<div class="bubble sticker"><img src="${esc(m.media)}" loading="lazy" alt="表情" data-zoom="1"></div>`
+    inner = mu
+      ? `<div class="bubble sticker"><img src="${esc(mu)}" loading="lazy" alt="表情" data-zoom="1"></div>`
       : `<div class="bubble sticker-ph"><span>🙂</span></div>`;
   } else if (t === 'link') {
     inner = `<div class="bubble">${linkify(m.content)}</div>`;
@@ -443,15 +502,26 @@ function linkify(text) {
 function updateLoadMoreHint() {
   const box = $('#loadMore');
   if (!box) return;
-  if (state.hasMore || state.loadingMore) {
+  const capped = domMsgCount() >= MAX_DOM_MSGS;
+  if (capped && state.hasMore) {
+    // 到窗口上限了：不再自动灌节点，把"继续往回翻"交给用户显式点。
+    // 直接说明会回收最远端的节点，免得用户以为消息丢了。
     box.style.display = 'flex';
-    $('#loadMoreText').textContent = state.loadingMore
-      ? '正在加载更早的消息…' : '继续上滑加载更早的消息';
+    $('#loadMoreText').textContent =
+      `已保留最近 ${MAX_DOM_MSGS} 条（继续往回翻会回收更远的节点）`;
+    $('#btnLoadMore').style.display = 'inline-block';
+    $('#btnLoadMore').textContent = '继续加载更早';
   } else {
-    box.style.display = 'flex';
-    $('#loadMoreText').textContent = '— 已经是最早的消息了 —';
+    $('#btnLoadMore').style.display = 'none';
+    if (state.hasMore || state.loadingMore) {
+      box.style.display = 'flex';
+      $('#loadMoreText').textContent = state.loadingMore
+        ? '正在加载更早的消息…' : '继续上滑加载更早的消息';
+    } else {
+      box.style.display = 'flex';
+      $('#loadMoreText').textContent = '— 已经是最早的消息了 —';
+    }
   }
-  $('#btnLoadMore').style.display = 'none';
   box.classList.toggle('lm-end', !state.hasMore && !state.loadingMore);
 }
 
@@ -483,9 +553,11 @@ async function loadMore() {
   state.msgLoaded += d.items.length;
   state.hasMore = d.has_more;
   state.loadingMore = false;
+  trimDomIfNeeded();
 
   // 保持视口位置：新内容在顶部插入，补偿滚动高度差 → 视觉上"无缝"
-  sc.scrollTop = sc.scrollHeight - prevH;
+  // （回收过节点时高度差失去意义，别再补偿，否则会跳到怪位置）
+  if (!state.tailTrimmed) sc.scrollTop = sc.scrollHeight - prevH;
   updateLoadMoreHint();
 }
 
@@ -508,8 +580,21 @@ function onScroll() {
   const nearBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120;
   $('#jumpToday').style.display = nearBottom ? 'none' : 'block';
 
-  // 无缝加载：接近顶部就自动取更早的一页（有并发保护，见 loadMore）
-  if (sc.scrollTop < 300 && state.hasMore && !state.loadingMore) loadMore();
+  // 无缝加载：接近顶部就自动取更早的一页（有并发保护，见 loadMore）。
+  // 到 DOM 窗口上限后停手——否则一路滑到底就静默灌进几千个节点，
+  // 后续每一帧滚动都要为它们算布局。要继续往回翻，点一下提示条里的按钮。
+  if (sc.scrollTop < 300 && state.hasMore && !state.loadingMore
+      && domMsgCount() < MAX_DOM_MSGS) {
+    loadMore();
+  }
+
+  // 从历史深处滚回底部：最新那批早被回收了，得重新拉一次，
+  // 否则用户看到的是"会话莫名断在这里"
+  if (nearBottom && state.tailTrimmed && !state.loadingMore) {
+    state.tailTrimmed = false;     // 先置位，避免滚动事件里重入
+    loadNewestWindow();
+    return;
+  }
 
   // 找当前视口顶部的消息，显示其日期
   const list = $('#msgList');
@@ -832,17 +917,29 @@ async function runFinder() {
 
 const WEEK_CN = ['日', '一', '二', '三', '四', '五', '六'];
 
+/* 日历聚合缓存：/api/calendar 要按天扫一遍整个会话（18 万条的群聊就是 18 万行）。
+   日期面板会被反复开关，每次都重算纯属浪费——同一个会话的结果在本次会话内
+   是稳定的，缓存起来；库一变（loadConvs 刷新）就整体失效。 */
+const _calCache = new Map();
+
+const calCacheKey = () => `${state.current}|${state.account || ''}`;
+const invalidateCalCache = () => { _calCache.clear(); };
+
 async function openDatePicker() {
   if (!state.current) { alert('请先打开一个会话'); return; }
   $('#datePanel').style.display = 'flex';
   const body = $('#dateBody');
-  body.innerHTML = '<div class="hint">读取中…</div>';
-  let d;
-  try {
-    d = await api(`/api/calendar?conv_id=${encodeURIComponent(state.current)}&limit=4000`);
-  } catch (err) {
-    body.innerHTML = `<div class="hint">读取失败：${esc(err.message)}</div>`;
-    return;
+  const ck = calCacheKey();
+  let d = _calCache.get(ck);
+  if (!d) {
+    body.innerHTML = '<div class="hint">读取中…</div>';
+    try {
+      d = await api(`/api/calendar?conv_id=${encodeURIComponent(state.current)}&limit=4000`);
+    } catch (err) {
+      body.innerHTML = `<div class="hint">读取失败：${esc(err.message)}</div>`;
+      return;
+    }
+    _calCache.set(ck, d);
   }
   if (!d.days || !d.days.length) {
     body.innerHTML = '<div class="hint">该会话暂无可用时间数据</div>';
@@ -1463,7 +1560,11 @@ function bind() {
   $('#btnLoadMore').onclick = loadMore;
   $('#btnJumpTop').onclick = scrollToTop;
   $('#btnJumpBottom').onclick = () => scrollToBottom();
-  $('#jumpToday').onclick = () => scrollToBottom();
+  $('#jumpToday').onclick = () => {
+    // 最新的那批被回收过 → 光滚到底部只会看到断掉的列表，得重新拉
+    if (state.tailTrimmed) { loadNewestWindow(); return; }
+    scrollToBottom();
+  };
   $('#btnBack').onclick = () => $('#sidebar').classList.remove('hidden');
 
   // 会话内搜索
@@ -1501,7 +1602,7 @@ function bind() {
       document.body.appendChild(lb);
     }
     // 优先加载原图（media_full）；失败或无原图则退回当前缩略图
-    const full = img.dataset.full || img.src;
+    const full = safeUrl(img.dataset.full) || img.src;
     lb.innerHTML = `<img src="${esc(full)}" alt="">`
       + (img.dataset.full ? '<span class="lb-tag">原图</span>' : '');
     const big = lb.querySelector('img');

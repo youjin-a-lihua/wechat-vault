@@ -315,10 +315,22 @@ sudo docker compose -f docker-compose.single.yml up -d
 | `WV_BIND_IP` | 绑定内网 IP（**必填**，缺失即启动报错） |
 | `WV_PASSWORD` | KasmVNC 桌面口令（**必填**） |
 | `WV_PASSWORD_HASH` / `WV_SECRET` | 查看器访问密码 / 会话签名密钥（可选） |
-| `WV_ALLOW_CIDRS` | 允许访问的网段白名单 |
+| `WV_ALLOW_CIDRS` | 允许访问的网段白名单，支持 IPv6（如 `192.168.0.0/16,fd00::/8`） |
+| `WV_TRUST_PROXY` | 置 `1` 才信任 `X-Forwarded-For` / `X-Real-IP`。**直连部署必须留空** |
+| `WV_COOKIE_SECURE` | 置 `1` 强制会话 Cookie 带 `Secure`；走 HTTPS 反代时用 |
+| `WV_TOKEN_TTL_DAYS` | 会话有效期（天），默认 7，下限 1 小时；剩余不足 24h 自动续签 |
+| `WV_LOG_FILE` / `WV_LOG_MAX_MB` / `WV_LOG_KEEP` | 日志落盘路径 / 单文件上限 MB / 保留份数 |
 | `WV_MEDIA` / `WV_PLAIN_DBS` | 媒体目录 / 解密明文库目录 |
 
 > ⚠️ `.env` 里的 `$` 必须写成 `$$`（docker compose 会做变量插值）。
+>
+> ⚠️ `WV_TRUST_PROXY` 只在前面**确实**有反向代理时才能打开。直连暴露时
+> 这个头是客户端随便写的，打开等于把网段白名单和「仅本机可 reload」
+> 一起送人——伪造一行 `X-Forwarded-For: 127.0.0.1` 就能进。
+>
+> ⚠️ 会话失效的三种方式：单点登出（吊销该 `sid`）、
+> `POST /api/logout {"all":true}`（递增 epoch，踢掉所有设备）、
+> 或改 `WV_SECRET`（全部作废）。
 
 ### HTTP API
 

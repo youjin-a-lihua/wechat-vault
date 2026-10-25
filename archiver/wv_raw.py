@@ -44,7 +44,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import logging
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wv_io  # noqa: E402  原子落盘
+
 log = logging.getLogger(__name__)
+
 
 # 时区偏移（小时）：默认东八区，海外部署用 WV_TZ_OFFSET 覆盖
 # （按日分代的目录名依赖它，配错会让快照日期整体偏移）
@@ -108,11 +112,13 @@ def _load_index(dest: Path) -> dict:
     return {"version": "1.0", "generations": [], "files": []}
 
 def _save_index(dest: Path, data: dict) -> Path:
-    """写存档索引（覆盖式；文件很小，无需原子化）。"""
+    """写存档索引（覆盖式）。
+
+    原子写：这个文件记录每一代存档的清单，写到一半被 kill 会留下截断的
+    JSON，下次启动整份失效（存档轨显示空白，文件其实都还在）。
+    """
     data["updated_at"] = datetime.now(CST).isoformat()
-    out = dest / "archive-index.json"
-    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out
+    return wv_io.atomic_write_json(dest / "archive-index.json", data, indent=2)
 
 def _merge_manifest(manifest_path: Path, raw_files: list[dict], dest: Path) -> None:
     """把存档轨文件并入主 MANIFEST.json（若存在），保持单一完整性清单。"""

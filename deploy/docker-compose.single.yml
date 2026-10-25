@@ -32,6 +32,13 @@ services:
     # ── host 网络：手机迁移必需（见文件头说明）──
     network_mode: host
 
+    # 容器日志封顶：autosync 每轮都会打一批，不封顶迟早把宿主盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
     # linuxserver base 用 PUID/PGID 管理内部用户（abc），
     # 不要用 compose 的 user: 指令（会破坏 s6 init）
     environment:

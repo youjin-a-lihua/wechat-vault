@@ -221,6 +221,13 @@ def _media_html(m: dict, inline_media: bool, media_root: Path | None) -> str:
     rel = (m.get("media") or "").strip()
     if not rel:
         return ""
+    # scheme 白名单：只放行站内相对路径与 http(s)。导出文件是给人双击打开的
+    # 独立 HTML，里面的 <a href> 一旦是 javascript: 就是真能点的执行入口
+    # （服务端出口已净化过一遍，这里是第二道——导出的库来源更杂）
+    if not (rel.startswith("/") and not rel.startswith("//")) \
+            and not rel.lower().startswith(("http://", "https://")):
+        log.debug("媒体路径 scheme 不在白名单，导出里跳过：%r", rel[:40])
+        return ""
     t = m.get("type")
     src = rel
     if inline_media and media_root:

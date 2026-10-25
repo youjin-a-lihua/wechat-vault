@@ -239,8 +239,15 @@ def main() -> int:
                               str(Path(os.environ.get("WV_LOGS", "/data/logs")) / "autosync.log"))
     try:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    except OSError as e:
+        # 轮转：autosync 是长跑进程，一轮一轮地写，不封顶的话这个日志文件
+        # 会无限长（落在数据卷上，最终把卷撑满 → 微信库和归档库一起写不进去）
+        import logging.handlers as _lh
+        mb = float(os.environ.get("WV_LOG_MAX_MB", "20"))
+        keep = int(os.environ.get("WV_LOG_KEEP", "3"))
+        handlers.append(_lh.RotatingFileHandler(
+            log_file, maxBytes=int(mb * 1024 * 1024),
+            backupCount=max(1, keep), encoding="utf-8"))
+    except (OSError, ValueError) as e:
         print("日志文件不可写（%s），仅输出到标准输出：%s" % (log_file, e),
               file=sys.stderr)
     logging.basicConfig(
