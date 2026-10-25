@@ -9,8 +9,8 @@ wv_winkey.py —— Windows 微信 4.x 密钥提取器（纯 Python，无需第�
     共 96 个 hex 字符（48 字节明文密钥材料）+ 包裹字符。
 
     我们扫描 Weixin.exe 的私有可读内存，匹配该模式，
-    再用 HMAC-SHA512(page1, salt, enc_key) 校验 page 1 的末尾 64 字节，
-    只有校验通过才认定为真密钥——避免把随机内存当成密钥。
+    再用**解密裁判**校验：按 archiver/wv_sync.decrypt_one 的页模型解 page 0，
+    明文是合法 SQLite 才认定为真密钥——不再猜 HMAC 公式（错一处就是假阴性）。
 
 图片 .dat 的 V2 密钥同理（AES-128-ECB），单独扫描。
 
@@ -20,8 +20,10 @@ wv_winkey.py —— Windows 微信 4.x 密钥提取器（纯 Python，无需第�
     python wv_winkey.py --img-only     # 只提图片密钥
     python wv_winkey.py --pid 31552    # 指定 PID
 
-输出：
-    all_keys.json      { "db_dir": "...", "keys": { "message/message_0.db": "<96hex>", ... } }
+输出（密钥契约，与 archiver/wv_sync.load_keys 对齐）：
+    all_keys.json      { "db_dir": "...",
+                         "keys": { "message/message_0.db":
+                                       {"enc_key": "<64hex>", "salt": "<32hex>"}, ... } }
     image_key.json     { "aes_key": "<32hex>" }
 """
 
@@ -30,8 +32,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.wintypes as wt
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -41,6 +41,12 @@ from pathlib import Path
 import logging
 
 log = logging.getLogger(__name__)
+
+# 解密裁判在 archiver/wv_sync（与生产解密器同一份页模型实现）
+_ARCHIVER = Path(__file__).resolve().parent.parent / "archiver"
+if str(_ARCHIVER) not in sys.path:
+    sys.path.insert(0, str(_ARCHIVER))
+from wv_sync import verify_key_by_decrypt, verify_page0_key  # noqa: E402
 
 # ---------------------------------------------------------------- Windows API
 
@@ -165,10 +171,10 @@ BARE_PATTERN = re.compile(rb"(?<![0-9a-fA-F])([0-9a-fA-F]{96})(?![0-9a-fA-F])")
 IMG_KEY_PATTERN = re.compile(rb"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])")
 
 
-def scan_process_for_db_keys(pid: int) -> dict[str, str]:
+def scan_process_for_db_keys(pid: int) -> set[str]:
     """
-    扫描指定进程，返回 { db_relative_path: 96hex_key }
-    校验方式：HMAC-SHA512 验证各 .db 的 page 1
+    扫描指定进程，返回 96hex 候选密钥集合。
+    真伪由解密裁判（verify_key_against_db / _probe_chunk）判定，此处只收集候选。
     """
     handle = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                              False, pid)
@@ -176,7 +182,7 @@ def scan_process_for_db_keys(pid: int) -> dict[str, str]:
         err = ctypes.get_last_error()
         _log(f"[!] OpenProcess(PID {pid}) 失败，错误码 {err}"
               f"{'（需要管理员权限）' if err == 5 else ''}")
-        return {}
+        return set()
 
     _log(f"[*] 已打开 PID {pid}，开始枚举内存区域…")
     try:
@@ -210,71 +216,69 @@ def scan_process_for_db_keys(pid: int) -> dict[str, str]:
 
 def verify_key_against_db(enc_key_hex: str, salt_hex: str, db_path: Path) -> bool:
     """
-    SQLCipher 4 校验：page 1 的末尾 64 字节 = HMAC-SHA512(
-        key = PBKDF2(enc_key, salt, 256000, 32, sha512),
-        data = page1[16:4096-64+16] ... 简化：直接对 page1 前 (page_size-64) 做 HMAC
-    )
-    实际 SQLCipher4 格式：
-      page1 = salt(16) || encrypted_rest
-      HMAC 覆盖 = page1[16 : page_size-64]  （即 salt 之后的密文部分，含 reserve 前的数据）
-      存于 page1[page_size-64 : page_size]
-      且存储的 HMAC 会被 enc_key 再异或一次
+    解密裁判（唯一裁判，不再做 HMAC 猜谜）：
+    按 archiver/wv_sync.decrypt_one 的页模型解 page 0，明文是合法 SQLite 才算命中。
+
+    salt_hex 只做一致性核对（应等于该库前 16 字节），不参与密钥派生——
+    enc_key 本身就是已派生的 AES key，直接用于 AES。
     """
     try:
-        page_size = 4096
         with open(db_path, "rb") as f:
-            page1 = f.read(page_size)
-        if len(page1) < page_size:
+            head = f.read(16)
+        if len(head) < 16:
             return False
-
-        salt = bytes.fromhex(salt_hex)
-        enc_key = bytes.fromhex(enc_key_hex)
-
-        mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, salt, 256000, dklen=32)
-        # SQLCipher4: HMAC 输入为 page1[16 : page_size-64+16]
-        mac = hmac.new(mac_key, page1[16:page_size - 64 + 16], hashlib.sha512).digest()
-        stored = bytes(a ^ b for a, b in zip(page1[page_size - 64:page_size], mac_key[:64]))
-        return hmac.compare_digest(mac, stored)
-    except Exception:
+        if salt_hex and bytes.fromhex(salt_hex) != head:
+            log.debug("salt 与库头不一致，跳过：%s", db_path.name)
+            return False
+    except (OSError, ValueError) as e:
+        log.debug("库头读取失败：%s", e)
         return False
+    return verify_key_by_decrypt(db_path, enc_key_hex)
 
 
 _PROBE_CTX: dict = {}
 
 
+def _init_probe_ctx(page1: bytes) -> None:
+    """ProcessPoolExecutor 子进程 initializer。
+
+    Windows 的 spawn 会全新导入模块，全局字典在子进程里是空的——
+    必须用 initializer 把探测页传进去，否则 _probe_chunk 一执行就 KeyError、
+    并行校验整体失效退回单进程（实测 50s+）。
+    """
+    _PROBE_CTX["page1"] = page1
+
+
 def _probe_chunk(chunk: list[str]) -> str | None:
-    """模块级函数（必须，ProcessPoolExecutor 才能 pickle）"""
-    salt = _PROBE_CTX["salt"]
-    page1 = _PROBE_CTX["page1"]
-    want = _PROBE_CTX["want"]
+    """模块级函数（必须，ProcessPoolExecutor 才能 pickle）。
+
+    解密裁判批测：对每个候选取 cand[:64] 当 AES key 解 page 0，
+    明文是合法 SQLite 即命中。每个候选只需一次页解密，不再跑 PBKDF2 猜谜。
+    """
+    page1 = _PROBE_CTX.get("page1", b"")
+    if len(page1) < 4096:
+        return None
     for cand in chunk:
         try:
             enc = bytes.fromhex(cand[:64])
-            mk = hashlib.pbkdf2_hmac("sha512", enc, salt, 256000, dklen=32)
-        except Exception as e:
-            log.debug("候选派生失败，跳过：%s", e)
+        except ValueError as e:
+            log.debug("候选 hex 解析失败，跳过：%s", e)
             continue
-        m = hmac.new(mk, page1[16:4096 - 64 + 16], hashlib.sha512).digest()
-        st = bytes(a ^ b for a, b in zip(want, mk[:64]))
-        if hmac.compare_digest(m, st):
+        if verify_page0_key(page1, enc):
             return cand
     return None
 
 
-def match_keys_to_dbs(candidates: set[str], db_dir: Path) -> dict[str, str]:
+def match_keys_to_dbs(candidates: set[str], db_dir: Path) -> dict[str, dict]:
     """
-    高效匹配：SQLCipher4 的 HMAC 校验只需 mac_key = PBKDF2(enc_key, salt)。
+    把内存候选匹配到各库，返回 {相对路径: {"enc_key": 64hex, "salt": 32hex}}。
 
-    关键优化——PBKDF2 的密码是 enc_key、盐是 salt：
-      mac_key = PBKDF2-HMAC-SHA512(enc_key, salt, 256000, 32)
-      对某个固定库（salt 固定），每个候选 enc_key 都要算一次 PBKDF2（这是 256000 轮，
-      极慢）。但 HMAC 本身很快。
+    校验用解密裁判（解 page 0 验 SQLite 头）：每个候选一次页解密，
+    不再是 256000 轮 PBKDF2 × 候选数 的 HMAC 猜谜。
 
-      因此我们把 「HMAC 校验」提前算好：对每个库，遍历全部候选算 PBKDF2 → HMAC。
-      477 候选 × 23 库 × 256000 轮 ≈ 28 亿次哈希 —— 太慢！
-
-    真正可用的做法：先只用**一个库**（页最小、最可能命中的 session.db）
-    把候选缩到 1 个，然后一key通吃（微信全部库共用同一 enc_key，salt 每库不同）。
+    关键优化——微信全部库共用同一 enc_key，salt 每库不同：
+    先用一个探测库（优先 session.db）把候选缩到 1 个 master key，
+    然后逐库裁判确认（salt 取各库自己的前 16 字节，按契约写进结果）。
     """
     dbs = sorted(db_dir.rglob("*.db"))
     dbs = [d for d in dbs if not d.name.endswith("-wal") and not d.name.endswith("-shm")]
@@ -295,27 +299,26 @@ def match_keys_to_dbs(candidates: set[str], db_dir: Path) -> dict[str, str]:
     _log(f"[*] 用探测库缩小候选范围: {probe.relative_to(db_dir).as_posix()}")
     with open(probe, "rb") as f:
         page1 = f.read(4096)
-    salt = page1[:16]
-    want = page1[4096 - 64:4096]
 
     keys = list(candidates)
-    _log(f"[*] 候选 {len(keys)} 个，并行做 PBKDF2(256000) 校验…")
+    _log(f"[*] 候选 {len(keys)} 个，并行跑解密裁判（解 page 0 验 SQLite 头）…")
 
     master: str | None = None
     import time
     from concurrent.futures import ProcessPoolExecutor
     t0 = time.time()
 
-    # 拆成 N 份，多进程并行（PBKDF2 是纯 CPU 计算，GIL 无法并行）
+    # 拆成 N 份，多进程并行（纯 Python AES 兜底时是纯 CPU 计算）
     nproc = min(os.cpu_count() or 4, 8)
     chunks = [keys[i::nproc] for i in range(nproc)]
 
-    _PROBE_CTX["salt"] = salt
+    # 主进程自己也留一份，单进程兜底路径要用
     _PROBE_CTX["page1"] = page1
-    _PROBE_CTX["want"] = want
 
     try:
-        with ProcessPoolExecutor(max_workers=nproc) as ex:
+        with ProcessPoolExecutor(max_workers=nproc,
+                                 initializer=_init_probe_ctx,
+                                 initargs=(page1,)) as ex:
             for r in ex.map(_probe_chunk, chunks):
                 if r:
                     master = r
@@ -327,25 +330,27 @@ def match_keys_to_dbs(candidates: set[str], db_dir: Path) -> dict[str, str]:
     if master is not None:
         _log(f"  [OK] 命中 master key（{nproc} 进程并行，耗时 {time.time() - t0:.1f}s）")
     else:
-        _log(f"[!] {len(keys)} 个候选均未通过探测库校验（{time.time() - t0:.0f}s）")
+        _log(f"[!] {len(keys)} 个候选均未通过探测库裁判（{time.time() - t0:.0f}s）")
         return {}
 
     # 拿到 master key 后，全部库都能用（salt 不同，但 enc_key 同一个）
-    result: dict[str, str] = {}
+    result: dict[str, dict] = {}
     for db in dbs:
         rel = db.relative_to(db_dir).as_posix()
         try:
             with open(db, "rb") as f:
                 head = f.read(16)
-        except Exception as e:
+        except OSError as e:
             log.debug("库头读取失败，跳过该库：%s", e)
             continue
         if verify_key_against_db(master[:64], head.hex(), db):
-            result[rel] = master
+            # 契约：enc_key=已派生 AES key，salt=**该库**前 16 字节（不是 master 尾段）
+            result[rel] = {"enc_key": master[:64], "salt": head.hex()}
             _log(f"  [OK] {rel}")
         else:
             _log(f"  [--] {rel}  未通过（可能空库/未加密）")
-    _log(f"[*] master key = {master[:32]}…{master[64:]}（enc_key + salt）")
+    # 只露前 32 字符 + 尾 salt，绝不把完整 master key 打进日志（泄漏）
+    _log(f"[*] master key = {master[:32]}…{master[64:]}（enc_key 前 32 字符 + salt）")
     return result
 
 
@@ -370,7 +375,8 @@ def scan_image_key(pid: int, img_sample: Path | None) -> str | None:
     if img_sample and img_sample.exists():
         for c in cands:
             if verify_v2_dat(bytes.fromhex(c), img_sample):
-                _log(f"  [OK] 图片 V2 密钥校验通过: {c}")
+                # 只露前 8 字符，完整密钥只进 image_key.json（本地密钥目录）
+                _log(f"  [OK] 图片 V2 密钥校验通过: {c[:8]}…")
                 return c
     return None
 
@@ -397,26 +403,53 @@ def verify_v2_dat(aes_key: bytes, dat_path: Path) -> bool:
 
 # ------------------------------------------------------------------- 主流程
 
-def detect_db_dir() -> Path | None:
-    """自动定位微信 4.x db_storage"""
-    guesses: list[Path] = []
-    for drive in ("G:", "D:", "C:", "E:", "F:", "H:"):
-        for base in (rf"{drive}\We chat and QQ\Wechat\xwechat_files",
-                     rf"{drive}\xwechat_files",
-                     rf"{drive}\Documents\xwechat_files",
-                     rf"{drive}\WeChat Files"):
-            p = Path(base)
-            if p.exists():
-                guesses.extend(p.glob("*/db_storage"))
-    # 选 message 目录最大的那个
+def _expand_db_storage(root: Path) -> list[Path]:
+    """把提示路径展开成 db_storage 目录列表（兼容直接指到库目录的写法）。"""
+    out: list[Path] = []
+    if not root.exists():
+        return out
+    if root.name == "db_storage" and root.is_dir():
+        out.append(root)
+    if (root / "db_storage").is_dir():
+        out.append(root / "db_storage")
+    out.extend(q for q in root.glob("*/db_storage") if q.is_dir())
+    out.extend(q for q in root.glob("*/*/db_storage") if q.is_dir())
+    return out
+
+
+def _pick_richest(cands: list[Path]) -> Path | None:
+    """多个候选里挑 message 目录最大的那个（数据量最大的账号才是目标）。"""
     best, best_sz = None, -1
-    for g in guesses:
+    for g in cands:
         m = g / "message"
         if m.exists():
             sz = sum(f.stat().st_size for f in m.glob("*.db"))
             if sz > best_sz:
                 best, best_sz = g, sz
     return best
+
+
+def detect_db_dir(hint: str = "") -> Path | None:
+    """自动定位微信 4.x db_storage。
+
+    优先级：--db-dir 显式 hint → 环境变量 WV_DB_DIR / WV_WECHAT_FILES → 常见安装位置。
+    自定义安装路径（个人目录）不再硬编码在源码里——那是隐私红线，
+    一律从参数/环境变量取。
+    """
+    src = (hint
+           or os.environ.get("WV_DB_DIR", "")
+           or os.environ.get("WV_WECHAT_FILES", ""))
+    if src:
+        hit = _pick_richest(_expand_db_storage(Path(src)))
+        if hit is not None:
+            return hit
+    guesses: list[Path] = []
+    for drive in ("C:", "D:", "E:", "F:", "G:", "H:"):
+        for base in (rf"{drive}\xwechat_files",
+                     rf"{drive}\Documents\xwechat_files",
+                     rf"{drive}\WeChat Files"):
+            guesses.extend(_expand_db_storage(Path(base)))
+    return _pick_richest(guesses)
 
 
 def main() -> int:
@@ -437,17 +470,20 @@ def main() -> int:
         return 2
     _log(f"[*] 找到微信进程: {pids}")
 
-    db_dir = Path(args.db_dir) if args.db_dir else detect_db_dir()
+    db_dir = detect_db_dir(args.db_dir)
+    if db_dir is None and args.db_dir:
+        db_dir = Path(args.db_dir)   # 用户显式指定的路径原样尊重
     if db_dir:
         _log(f"[*] 数据库目录: {db_dir}")
     else:
-        _log("[!] 未自动定位到 db_storage，请用 --db-dir 指定")
+        _log("[!] 未自动定位到 db_storage，请用 --db-dir 指定"
+             "（或设 WV_DB_DIR / WV_WECHAT_FILES 环境变量）")
 
     rc = 0
 
     if not args.img_only:
         target_pids = [args.pid] if args.pid else [p for p, _ in pids]
-        merged: dict[str, str] = {}
+        merged: dict[str, dict] = {}
         for pid in target_pids:
             cands = scan_process_for_db_keys(pid)
             if not cands or not db_dir:
@@ -458,6 +494,9 @@ def main() -> int:
                 break
         if merged:
             kf = out_dir / "all_keys.json"
+            # 密钥契约：每库写 {"enc_key": "<64hex>", "salt": "<32hex>"} 字典
+            # （enc_key=已派生 AES key，salt=该库前 16 字节），与
+            #  archiver/wv_sync.load_keys 的字典分支对齐；不再写 96hex 拼接串。
             payload = {"db_dir": str(db_dir), "keys": merged}
             kf.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                           encoding="utf-8")

@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -55,18 +56,75 @@ BASE_TYPE = {
 }
 # local_type 高位是 WCDB 标志位，取低 32 位才是微信定义的消息类型
 
+def _norm_key_entry(v) -> tuple[str, str]:
+    """把 all_keys.json 单条值规约成 (enc_key_hex, salt_hex)。
+
+    契约（与其他工程师共享）：
+      · enc_key = 64 hex = **已派生的** AES key，直接用于 AES，不再走 KDF
+      · salt    = 32 hex = 该库前 16 字节
+    向后兼容旧工具输出的 96hex 拼接字符串（enc_key ++ salt），自动切开。
+    """
+    if isinstance(v, dict):
+        enc = str(v.get("enc_key") or "").strip().lower()
+        salt = str(v.get("salt") or "").strip().lower()
+    elif isinstance(v, str):
+        enc, salt = v.strip().lower(), ""
+    else:
+        return "", ""
+    if len(enc) == 96:
+        # 旧格式：96 hex = enc_key(64) ++ salt(32) 拼接 → 自动切开
+        if not salt:
+            salt = enc[64:]
+        enc = enc[:64]
+    if len(enc) != 64:
+        return "", ""
+    return enc, salt
+
+
 def load_keys(keys_path: Path) -> dict:
-    """读取 all_keys.json，返回 {相对路径: (enc_key_hex, salt_hex)}。"""
-    raw = json.loads(keys_path.read_text(encoding="utf-8"))
+    """读取 all_keys.json，返回 {相对路径: (enc_key_hex, salt_hex)}。
+
+    同时接受两种形态：
+      · 契约字典：{"keys": {rel: {"enc_key": "<64hex>", "salt": "<32hex>"}}}
+      · 旧工具输出：{"keys": {rel: "<96hex 拼接>"}} —— 自动切成 enc_key/salt
+    文件缺失或损坏时返回空 dict（是否放行由 load_key_material 决定）。
+    """
+    try:
+        raw = json.loads(keys_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        log.warning("密钥文件读取/解析失败，按空处理：%s", e)
+        return {}
+    if not isinstance(raw, dict):
+        log.warning("密钥文件顶层不是 JSON 对象，按空处理：%s", keys_path)
+        return {}
+    src = raw["keys"] if isinstance(raw.get("keys"), dict) else raw
     out: dict[str, tuple[str, str]] = {}
-    if "keys" in raw and isinstance(raw["keys"], dict):
-        for k, v in raw["keys"].items():
-            out[k] = (v, "")
-        return out
-    for k, v in raw.items():
-        if isinstance(v, dict) and v.get("enc_key"):
-            out[k] = (v["enc_key"], v.get("salt", ""))
+    for k, v in src.items():
+        if not isinstance(k, str) or k == "db_dir":
+            continue
+        enc, salt = _norm_key_entry(v)
+        if enc:
+            out[k] = (enc, salt)
+        elif v not in ("", None):
+            log.warning("忽略无法识别的密钥条目：%s", k)
     return out
+
+def load_key_material(keys_path: Path) -> tuple[dict, str, str]:
+    """装载密钥材料：all_keys.json + 同目录 passphrase.json。
+
+    G3 契约：passphrase.json 可用时，keys 文件缺失/为空都放行（keys 置空 dict），
+    「放进去就用」；两者都没有才算没有密钥材料，此时 err 非空即失败原因。
+    """
+    keys: dict[str, tuple[str, str]] = {}
+    if keys_path.is_file():
+        keys = load_keys(keys_path)
+    else:
+        log.debug("密钥文件不存在，按空处理：%s", keys_path)
+    passphrase_hex = load_passphrase(keys_path)
+    if not keys and not passphrase_hex:
+        return {}, "", ("既没有可用的 %s，同目录也没有可用的 passphrase.json —— "
+                        "至少要提供一种密钥材料" % keys_path.name)
+    return keys, passphrase_hex, ""
 
 def load_passphrase(keys_path: Path) -> str:
     """读取同目录 passphrase.json 里的账号级 password（64 hex）。"""
@@ -164,6 +222,107 @@ def decrypt_one(src: Path, dst: Path, enc_key: str, salt: str = "",
     dst.write_bytes(bytes(out))
     return True
 
+
+# ────────────────────────────────────────────────────────── 解密裁判 ──
+# 历史教训：HMAC 公式猜谜（salt 是否 XOR 0x3A、轮数是 2 还是 256000）
+# 错任何一处就是「扫描 0 命中」的假阴性，而且没人能从结果反推出公式哪版对。
+# 这里以实证解密器 decrypt_one 的页模型为唯一裁判：把 page 0 解出来，
+# 看明文是不是合法 SQLite 页头。公式再错也错不了——解得开就是真密钥。
+
+def _aes_cbc_decrypt(aes_key: bytes, iv: bytes, ct: bytes) -> bytes:
+    """AES-CBC 解密（无 padding），供解密裁判使用。
+
+    优先 pycryptodome；缺失时退回 tools/wv_wxdb 的纯 Python AES-256，
+    保证 wv_winkey/wv_keymem 这类零依赖抓 key 工具在裸机上也能跑裁判。
+    """
+    if _AES is not None:
+        return _AES.new(aes_key, _AES.MODE_CBC, iv).decrypt(ct)
+    tools_dir = str(Path(__file__).resolve().parent.parent / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from wv_wxdb import _aes_cbc_decrypt as pure_cbc
+    return pure_cbc(aes_key, iv, ct)
+
+
+def decrypt_page0_blob(page0: bytes, aes_key: bytes) -> bytes | None:
+    """按 decrypt_one 的页模型解 page 0，返回重建后的明文页（失败返回 None）。"""
+    if len(page0) < _PAGE_SZ or len(aes_key) != 32:
+        return None
+    iv = page0[_IV_OFF:_HMAC_OFF]
+    ct = page0[_SALT_SZ:_IV_OFF]
+    try:
+        pt = _aes_cbc_decrypt(aes_key, iv, ct)
+    except Exception as e:  # 纯实现/后端异常都不该把工具带崩
+        log.debug("page0 解密失败：%s", e)
+        return None
+    return b"SQLite format 3\x00" + pt + b"\x00" * _RESERVE
+
+
+def looks_like_sqlite_page0(page: bytes) -> bool:
+    """验证重建页是合法 SQLite page 0（对照 SQLite 头固定字段）。"""
+    if len(page) < 100 or not page.startswith(b"SQLite format 3\x00"):
+        return False
+    (psz,) = struct.unpack(">H", page[16:18])
+    if psz == 1:
+        psz = 65536
+    if psz < 512 or psz > 65536 or psz & (psz - 1):
+        return False
+    if page[18] not in (1, 2) or page[19] not in (1, 2):
+        return False
+    # SQLite 格式规定的固定载荷分数（64/32/32），随机明文几乎不可能凑齐
+    if page[21] != 64 or page[22] != 32 or page[23] != 32:
+        return False
+    if struct.unpack(">I", page[44:48])[0] not in (1, 2, 3, 4):
+        return False
+    return struct.unpack(">I", page[56:60])[0] in (1, 2, 3)
+
+
+def verify_page0_key(page0: bytes, enc_key: bytes) -> bool:
+    """解密裁判核心：page0 密文 + AES key → 明文是否合法 SQLite 页。"""
+    page = decrypt_page0_blob(page0, enc_key)
+    return page is not None and looks_like_sqlite_page0(page)
+
+
+def verify_key_by_decrypt(db_path: Path, enc_key_hex: str, full: bool = False) -> bool:
+    """解密裁判入口：验证 enc_key 是否为该库密钥（唯一裁判，不看 HMAC）。
+
+    full=False：只解 page 0 校验页头（微秒级，用于内存候选批量筛选）；
+    full=True ：解全文件后 sqlite3.connect() 试开（金标准，用于最终确认）。
+    """
+    key_hex = enc_key_hex.strip().lower()
+    if len(key_hex) != 64:
+        return False
+    try:
+        enc_key = bytes.fromhex(key_hex)
+    except ValueError:
+        return False
+    try:
+        with open(db_path, "rb") as f:
+            page0 = f.read(_PAGE_SZ)
+    except OSError as e:
+        log.warning("裁判读库失败 %s：%s", db_path, e)
+        return False
+    if len(page0) < _PAGE_SZ:
+        return False
+    if not verify_page0_key(page0, enc_key):
+        return False
+    if not full:
+        return True
+    with tempfile.TemporaryDirectory() as td:
+        dst = Path(td) / "judge.db"
+        if not decrypt_one(Path(db_path), dst, key_hex):
+            return False
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % dst, uri=True)
+            try:
+                conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                return True
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            log.debug("解密裁判全量试开失败 %s：%s", db_path, e)
+            return False
+
 def decrypt_all(account: Path, plain_out: Path, keys: dict,
                 sqlcipher: str = "", passphrase_hex: str = "") -> int:
     """解密 db_storage 下所有库，保持相对路径结构。返回成功数。"""
@@ -174,8 +333,14 @@ def decrypt_all(account: Path, plain_out: Path, keys: dict,
         rel = src.relative_to(db_dir).as_posix()
         ent = keys.get(rel)
         if not ent:
-            log.debug("无密钥，跳过：%s", rel)
-            continue
+            if not passphrase_hex:
+                log.debug("无密钥，跳过：%s", rel)
+                continue
+            # G2：有账号级 passphrase 时，未登记的库也要解。
+            # 微信日后新增的 message_23.db 这类库不在 all_keys.json 里，
+            # 静默跳过会让它们永远解不开；decrypt_one 的 passphrase 分支
+            # 会用「文件自带 salt + 账号 passphrase」自行派生密钥。
+            ent = ("", "")
         total += 1
         if decrypt_one(src, plain_out / rel, ent[0], ent[1], passphrase_hex=passphrase_hex):
             ok += 1
@@ -851,12 +1016,13 @@ def main() -> int:
     log.info("账号目录：%s", account)
 
     keys_path = Path(a.keys)
-    if not keys_path.is_file():
-        log.error("密钥文件不存在：%s", keys_path)
+    # G3：passphrase.json 可用时，keys 文件缺失/为空照常启动（无感续用）；
+    # 两种密钥材料都没有才报错退出。
+    keys, passphrase_hex, key_err = load_key_material(keys_path)
+    if key_err:
+        log.error("%s", key_err)
         return 2
-    keys = load_keys(keys_path)
     log.info("密钥：%d 个库", len(keys))
-    passphrase_hex = load_passphrase(keys_path)
     if passphrase_hex:
         log.info("检测到 passphrase.json，将用账号级 passphrase 派生各库密钥")
 

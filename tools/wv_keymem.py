@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -14,34 +13,30 @@ from pathlib import Path
 
 log = logging.getLogger("wv_keymem")
 
-KDF_ITER = 256000
+# SQLCipher 4 的 HMAC key 派生固定 2 轮（不是口令 KDF 的 256000 轮）
+MAC_KDF_ITER = 2
 KEY_SZ = 32
 SALT_SZ = 16
 PAGE_SZ = 4096
 RESERVE = 48
 
+# 解密裁判在 archiver/wv_sync（与生产解密器同一份页模型实现）
+_ARCHIVER = Path(__file__).resolve().parent.parent / "archiver"
+if str(_ARCHIVER) not in sys.path:
+    sys.path.insert(0, str(_ARCHIVER))
+from wv_sync import verify_key_by_decrypt  # noqa: E402
+
 def derive(enc_key: bytes, salt: bytes):
+    """SQLCipher 4：enc_key 已是最终 AES key，不再派生；
+    只需派生 HMAC 校验 key = PBKDF2(enc_key, salt^0x3A, 2 轮)。"""
     mac_salt = bytes(b ^ 0x3A for b in salt)
-    aes = hashlib.pbkdf2_hmac("sha512", enc_key, salt, KDF_ITER, dklen=KEY_SZ)
-    mac = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, KDF_ITER, dklen=KEY_SZ)
-    return aes, mac
+    mac = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, MAC_KDF_ITER, dklen=KEY_SZ)
+    return enc_key, mac
 
 def verify_key(enc_key: bytes, db_path: Path) -> bool:
-    """用 page1 末尾的 HMAC 校验候选 key 是否真的是这个库的密钥。"""
-    try:
-        with open(db_path, "rb") as f:
-            page1 = f.read(PAGE_SZ)
-    except OSError:
-        return False
-    if len(page1) < PAGE_SZ:
-        return False
-    salt = page1[:SALT_SZ]
-    _, mac_key = derive(enc_key, salt)
-    ct = page1[SALT_SZ:PAGE_SZ - RESERVE]
-    mac = hmac.new(mac_key, ct, hashlib.sha512).digest()
-    stored = page1[PAGE_SZ - RESERVE:PAGE_SZ - RESERVE + 64]
-    return hmac.compare_digest(mac, stored) or \
-        hmac.compare_digest(mac, bytes(a ^ b for a, b in zip(stored, mac_key[:64])))
+    """解密裁判：按 wv_sync.decrypt_one 的页模型解 page 0，
+    验证明文是合法 SQLite 页。HMAC 猜谜已废弃——公式错一处就是假阴性。"""
+    return verify_key_by_decrypt(db_path, enc_key.hex())
 
 def readable_regions(pid: int):
     """列出进程可读的内存区间（跳过文件映射，只扫匿名/堆）。"""
@@ -108,7 +103,7 @@ def scan(pid: int, salt: bytes, db_path: Path, max_hits: int = 4000):
                     return None
     finally:
         mem.close()
-    log.warning("共 %d 个 salt 命中点，均未通过 HMAC 校验", hits)
+    log.warning("共 %d 个 salt 命中点，均未通过解密裁判", hits)
     return None
 
 def find_pid(pattern: str = "opt/wechat/wechat") -> int:
