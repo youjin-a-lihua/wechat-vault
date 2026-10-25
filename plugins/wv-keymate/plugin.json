@@ -1,0 +1,47 @@
+{
+  "id": "wv-keymate",
+  "name": "密钥管家",
+  "version": "0.1.0",
+  "description": "微信 4.x 个人数据导出/归档的密钥流水线：校验、规范化、投递 NAS、触发同步一条龙。取钥手段只支持文档化、非侵入路线（只读内存扫描 / 系统调试 API 进程快照），绝不开公网。",
+  "keywords": ["wechat", "sqlcipher", "keymate", "backup", "vault"],
+  "platform": {
+    "producer": "windows",
+    "consumer": "nas-linux",
+    "note": "Docker 容器内取不了密钥——取钥必须在 Windows 宿主机侧做，产物投递 NAS 后由容器内 archiver/wv_sync.py 消费"
+  },
+  "runtime": {
+    "python": ">=3.10",
+    "stdlib_only": true,
+    "optional_dependencies": ["pycryptodome>=3.19"]
+  },
+  "entry": "keymate.py",
+  "components": {
+    "keymate.py": "主入口：导入（64hex 粘贴 / JSON 拖入，兼容 96hex 拼接与 dict 旧格式）→ 解密裁判校验 → 规范化契约 → robocopy 投递 → POST /api/ingest",
+    "extract_scan.py": "路线 A：内存扫描（微信 ≤ 4.0.3.36），捕获窗口模式（≤50ms 高频轮询）",
+    "extract_dump.py": "路线 B：文档化 MiniDumpWriteDump 进程只读快照 + 离线扫描（新版微信）",
+    "drop.ps1": "一键投递密钥包到 NAS 共享并触发同步"
+  },
+  "contracts": {
+    "passphrase.json": {
+      "passphrase": "<64 hex = 32 字节账号级 password>",
+      "wxid": "wxid_xxx",
+      "captured_at": "ISO8601",
+      "source": "scan|dump|manual",
+      "wechat_version": "4.x.x"
+    },
+    "all_keys.json": {
+      "db_dir": "<db_storage 相对/绝对路径>",
+      "keys": {
+        "<相对路径>.db": { "enc_key": "<64 hex 已派生 AES key>", "salt": "<32 hex 该库前 16 字节>" }
+      }
+    }
+  },
+  "judge": "SQLCipher 4 页模型解密（PBKDF2-HMAC-SHA512/256000 或直用 enc_key）→ sqlite3 试开并读 schema，能开即密钥有效；不用 HMAC 猜谜",
+  "security": {
+    "network": "只走 SMB / 内网 HTTP；目标必须在私网白名单 10/8、172.16/12、192.168/16、127/8",
+    "logging": "绝不打印密钥本体，只打前 6 位 + 长度",
+    "compliance": "不含注入类实现、不携带第三方取钥工具代码或下载指向；README 仅作风险告知"
+  },
+  "deliver_to": "\\\\<NAS>\\wechat-vault\\wx_backup\\  ←→  容器 /data/wx_backup（wv_sync --keys 默认目录）",
+  "license": "MIT"
+}
