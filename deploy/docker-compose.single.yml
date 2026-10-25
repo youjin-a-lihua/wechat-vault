@@ -98,8 +98,24 @@ services:
     healthcheck:
       # host 模式 + uvicorn 绑内网 IP：127.0.0.1 不通，用绑定 IP 探测
       #（容器与宿主同网络栈，绑定 IP 在容器内可直接到达）
-      test: ["CMD-SHELL", "curl -fsS http://$${WV_BIND_IP}:8790/healthz >/dev/null 2>&1 || exit 1"]
+      #
+      # 不能只依赖 ${WV_BIND_IP}：Docker 的 healthcheck 走 exec，不经过 s6 的
+      # with-contenv，而 `docker commit` 出来的镜像还可能整个丢掉 env ——
+      # 变量为空时 http://:8790 直接失败，容器被永久标成 unhealthy 却仍在
+      # 正常服务（实测踩到）。所以先回退到变量，再回退到"从正在监听里取地址"，
+      # 最后才用 127.0.0.1，三档兜底。
+      test:
+        - CMD-SHELL
+        - >-
+          H="$${WV_BIND_IP:-}";
+          if [ -z "$$H" ]; then
+            H=$$(ss -ltnp 2>/dev/null | sed -n 's/.*:8790 .*\\[\\([^]]*\\)\\]$$/\\1/p' | head -1);
+            H=$${H:-$$(ss -ltn 2>/dev/null | awk '/:8790 /{print $$4}' | sed 's/:[0-9]*$$//' | head -1)};
+          fi;
+          H=$${H:-127.0.0.1};
+          curl -fsS "http://$$H:8790/healthz" >/dev/null 2>&1 || exit 1
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 90s
       start_period: 90s
